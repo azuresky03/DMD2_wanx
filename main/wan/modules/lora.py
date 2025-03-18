@@ -10,10 +10,11 @@ class LoRALayer(nn.Module):
         self.layer = layer
         self.rank = rank
         self.scale = scale
+        self.enabled = True  # 默认启用LoRA
         
         # Initialize low-rank matrices with proper initialization
-        self.lora_A = nn.Parameter(torch.zeros(layer.weight.size(0), rank))
-        self.lora_B = nn.Parameter(torch.zeros(rank, layer.weight.size(1)))
+        self.lora_A = nn.Parameter(torch.zeros(layer.weight.size(0), rank),requires_grad=True)
+        self.lora_B = nn.Parameter(torch.zeros(rank, layer.weight.size(1)),requires_grad=True)
 
         # 使用 Kaiming 初始化 A 矩阵
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -21,10 +22,23 @@ class LoRALayer(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
-        # Compute the low-rank adaptation
-        lora_output = (self.lora_A @ self.lora_B) @ x
-        # Scale the output
-        return self.layer(x) + self.scale * lora_output
+        # 原始层的输出
+        original_output = self.layer(x)
+        
+        # 只有在enabled为True时才应用LoRA
+        if self.enabled:
+            # Compute the low-rank adaptation
+            lora_output = (self.lora_A @ self.lora_B) @ x
+            # Scale the output and add to original
+            return original_output + self.scale * lora_output
+        else:
+            # 不使用LoRA，直接返回原始输出
+            return original_output
+
+    def set_lora_enabled(self, enabled=True):
+        """设置是否启用LoRA"""
+        self.enabled = enabled
+
 
 def apply_lora_to_wanx(model, rank=4, scale=1.0):
     modules_to_replace = []
@@ -42,8 +56,40 @@ def apply_lora_to_wanx(model, rank=4, scale=1.0):
     return model
 
 
+# 新增：在整个模型范围内设置LoRA状态
+def set_lora_state(model, enabled=True):
+    """
+    在整个模型中设置所有LoRA层的状态
+    
+    Args:
+        model: 包含LoRA层的模型
+        enabled: 是否启用LoRA,True为启用,False为禁用
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, LoRALayer):
+            module.set_lora_enabled(enabled)
+            count += 1
+    
+    state = "启用" if enabled else "禁用"
+    print(f"已{state} {count} 个LoRA层")
+    return model
+
+
 if __name__ == '__main__':
     # Test LoRALayer
     from main.wan.modules.model import *
     model = WanModel()
     model = apply_lora_to_wanx(model)
+    
+    # 测试LoRA开关功能
+    print("使用LoRA进行推理...")
+    # ... 执行推理代码 ...
+    
+    print("禁用LoRA...")
+    set_lora_state(model, enabled=False)
+    # ... 执行不带LoRA的推理代码 ...
+    
+    print("重新启用LoRA...")
+    set_lora_state(model, enabled=True)
+    # ... 执行带LoRA的推理代码 ...
