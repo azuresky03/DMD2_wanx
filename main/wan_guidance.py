@@ -1,82 +1,54 @@
 from main.utils import get_x0_from_noise, DummyNetwork, NoOpContext
-from main.wan.modules.model import WanModel
+# from main.wan.modules.model import WanModel
+from main.wan.modules.model_cfg import WanModelCFG as WanModel
 from main.wan.modules.lora import apply_lora_to_wanx, set_lora_state
 from main.wan.flow_match import FlowMatchScheduler
-from main.sd_unet_forward import classify_forward
+from main.fm_solvers_unipc import FlowUniPCMultistepScheduler
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
 import types 
+from main.wan.modules.cls import Classifier
+from fastvideo.utils.communications import broadcast
+from torch.utils.checkpoint import checkpoint
 
-def predict_noise(unet, noisy_latents, text_embeddings, uncond_embedding, timesteps, 
-    guidance_scale=1.0, unet_added_conditions=None, uncond_unet_added_conditions=None
-):
-    CFG_GUIDANCE = guidance_scale > 1
-
-    if CFG_GUIDANCE:
-        model_input = torch.cat([noisy_latents] * 2) 
-        embeddings = torch.cat([uncond_embedding, text_embeddings]) 
-        timesteps = torch.cat([timesteps] * 2) 
-
-        if unet_added_conditions is not None:
-            assert uncond_unet_added_conditions is not None 
-            condition_input = {}
-            for key in unet_added_conditions.keys():
-                condition_input[key] = torch.cat(
-                    [uncond_unet_added_conditions[key], unet_added_conditions[key]] # should be uncond, cond, check the order  
-                )
-        else:
-            condition_input = None 
-
-        noise_pred = unet(model_input, timesteps, embeddings, added_cond_kwargs=condition_input).sample
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond) 
-    else:
-        model_input = noisy_latents 
-        embeddings = text_embeddings
-        timesteps = timesteps    
-        noise_pred = unet(model_input, timesteps, embeddings, added_cond_kwargs=unet_added_conditions).sample
-
-    return noise_pred  
+from time import sleep
 
 class WanGuidance(nn.Module):
-    def __init__(self, args, accelerator):
+    def __init__(self, args, device):
         super().__init__()
         self.args = args 
 
-        self.wan = WanModel().from_pretrained(args.model_id)
+        self.wan = WanModel.from_pretrained(args.model_id)
 
         self.wan.requires_grad_(False)
         apply_lora_to_wanx(self.wan,args.lora_rank, args.lora_scale)
+        set_lora_state(self.wan, enabled=True)
 
-        self.real_unet = self.wan
-        self.fake_unet = self.wan
+        # self.real_unet = self.wan
+        # self.fake_unet = self.wan
 
         self.gan_alone = args.gan_alone 
 
         # somehow FSDP requires at least one network with dense parameters (models from diffuser are lazy initialized so their parameters are empty in fsdp mode)
-        self.dummy_network = DummyNetwork() 
-        self.dummy_network.requires_grad_(False)
+        # self.dummy_network = DummyNetwork() 
+        # self.dummy_network.requires_grad_(False)
 
         # we move real unet to half precision
         # as we don't backpropagate through it
-        if args.use_fp16:
-            self.wan = self.wan.to(torch.bfloat16)
+        # if args.use_fp16:
+        #     self.wan = self.wan.to(torch.bfloat16)
 
         if self.gan_alone:
             del self.real_unet
 
-        self.scheduler = FlowMatchScheduler(shift=)
-        
-        alphas_cumprod = self.scheduler.alphas_cumprod
-        self.register_buffer(
-            "alphas_cumprod",
-            alphas_cumprod
-        )
+        # self.scheduler = FlowMatchScheduler(shift=args.shift,sigma_min=0.0, extra_one_step=True)
+        self.scheduler = FlowUniPCMultistepScheduler()
+        self.scheduler.set_timesteps(num_inference_steps=args.denoising_timestep,shift=args.shift,device=device)
 
         self.num_train_timesteps = args.num_train_timesteps 
-        self.min_step = int(args.min_step_percent * self.scheduler.num_train_timesteps)
-        self.max_step = int(args.max_step_percent * self.scheduler.num_train_timesteps)
+        self.min_step = int(args.min_step_percent * args.denoising_timestep)
+        self.max_step = int(args.max_step_percent * args.denoising_timestep)
         
         self.real_guidance_scale = args.real_guidance_scale 
         self.fake_guidance_scale = args.fake_guidance_scale
@@ -88,47 +60,16 @@ class WanGuidance(nn.Module):
         self.cls_on_clean_image = args.cls_on_clean_image 
         self.gen_cls_loss = args.gen_cls_loss 
 
-        self.accelerator = accelerator
-
         if self.cls_on_clean_image:
-            self.fake_unet.forward = types.MethodType(
-                classify_forward, self.fake_unet
-            )
+            # self.fake_unet.forward = types.MethodType(
+            #     classify_forward, self.fake_unet
+            # )
 
-            if accelerator.is_local_main_process:
-                print("Note that we randomly initialized a bunch of parameters. FSDP mode 4 hybrid_shard will have non-synced parameters across nodes which would lead to training problems. The current solution is to save the checkpoint 0 and resume")
-
-            if args.sdxl:
-                self.cls_pred_branch = nn.Sequential(
-                    nn.Conv2d(kernel_size=4, in_channels=1280, out_channels=1280, stride=2, padding=1), # 32x32 -> 16x16 
-                    nn.GroupNorm(num_groups=32, num_channels=1280),
-                    nn.SiLU(),
-                    nn.Conv2d(kernel_size=4, in_channels=1280, out_channels=1280, stride=2, padding=1), # 16x16 -> 8x8 
-                    nn.GroupNorm(num_groups=32, num_channels=1280),
-                    nn.SiLU(),
-                    nn.Conv2d(kernel_size=4, in_channels=1280, out_channels=1280, stride=2, padding=1), # 8x8 -> 4x4
-                    nn.GroupNorm(num_groups=32, num_channels=1280),
-                    nn.SiLU(),
-                    nn.Conv2d(kernel_size=4, in_channels=1280, out_channels=1280, stride=4, padding=0), # 4x4 -> 1x1
-                    nn.GroupNorm(num_groups=32, num_channels=1280),
-                    nn.SiLU(),
-                    nn.Conv2d(kernel_size=1, in_channels=1280, out_channels=1, stride=1, padding=0), # 1x1 -> 1x1
-                )
-            else:
-                # SDv1.5 
-                self.cls_pred_branch = nn.Sequential(
-                    nn.Conv2d(kernel_size=4, in_channels=1280, out_channels=1280, stride=2, padding=1), # 8x8 -> 4x4 
-                    nn.GroupNorm(num_groups=32, num_channels=1280),
-                    nn.SiLU(),
-                    nn.Conv2d(kernel_size=4, in_channels=1280, out_channels=1280, stride=4, padding=0), # 4x4 -> 1x1
-                    nn.GroupNorm(num_groups=32, num_channels=1280),
-                    nn.SiLU(),
-                    nn.Conv2d(kernel_size=1, in_channels=1280, out_channels=1, stride=1, padding=0), # 1x1 -> 1x1
-                )
+            wan_dim = self.wan.dim  # 使用WanModel的维度(5120)
+            self.cls_pred_branch = Classifier(input_dim=wan_dim).to(device).to(torch.bfloat16 if self.use_fp16 else torch.float32)
 
             self.cls_pred_branch.requires_grad_(True)
 
-        self.sdxl = args.sdxl 
         self.gradient_checkpointing = args.gradient_checkpointing 
 
         self.diffusion_gan = args.diffusion_gan 
@@ -136,98 +77,54 @@ class WanGuidance(nn.Module):
 
         self.network_context_manager = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if self.use_fp16 else NoOpContext()
 
-    def compute_cls_logits(self, image, text_embedding, unet_added_conditions):
-        # we are operating on the VAE latent space, no further normalization needed for now 
-        if self.diffusion_gan:
-            timesteps = torch.randint(
-                0, self.diffusion_gan_max_timestep, [image.shape[0]], device=image.device, dtype=torch.long
-            )
-            image = self.scheduler.add_noise(image, torch.randn_like(image), timesteps)
-        else:
-            timesteps = torch.zeros([image.shape[0]], dtype=torch.long, device=image.device)
+    def one_step(self, latents, encoder_hidden_states, guidance_tensor, timesteps, index):
 
+        noise = torch.randn_like(latents)
+        if self.args.sp_size > 1:
+            broadcast(noise)
+
+        noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
+
+        x = [noisy_latents[i] for i in range(noisy_latents.size(0))]
         with self.network_context_manager:
-            rep = self.fake_unet.forward(
-                image, timesteps, text_embedding,
-                added_cond_kwargs=unet_added_conditions,
-                classify_mode=True
-            )
+            pred_noise = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor)[0]
 
-        # we only use the bottleneck layer 
-        rep = rep[-1].float()
-        logits = self.cls_pred_branch(rep).squeeze(dim=[2, 3])
-        return logits
+        self.scheduler.model_outputs = [None] * self.scheduler.config.solver_order
+        self.scheduler.lower_order_nums = 0
+        self.scheduler._step_index = int(index.item())
+        self.scheduler.last_sample = None
+        model_pred, model_pred_x0 = self.scheduler.step(sample=noisy_latents, model_output=pred_noise, timestep=timesteps,return_dict=False)
 
+        return model_pred, pred_noise, noisy_latents, noise, model_pred_x0
 
     def compute_distribution_matching_loss(
         self, 
         latents,
-        text_embedding,
+        encoder_hidden_states,
         uncond_embedding,
-        unet_added_conditions,
-        uncond_unet_added_conditions
+        guidance_tensor,
     ):
         original_latents = latents 
-        batch_size = latents.shape[0]
         with torch.no_grad():
-            timesteps = torch.randint(
-                self.min_step, 
-                min(self.max_step+1, self.num_train_timesteps),
-                [batch_size], 
+
+            index = torch.randint(
+                self.min_step,min(self.max_step, self.num_train_timesteps)-1,
+                [1], 
                 device=latents.device,
                 dtype=torch.long
             )
+            if self.args.sp_size > 1:
+                broadcast(index)
+            timesteps = self.scheduler.timesteps[index]
 
-            noise = torch.randn_like(latents)
+            set_lora_state(self.wan, enabled=True)
+            _, _, _, _, fake_video = self.one_step(latents, encoder_hidden_states, guidance_tensor, timesteps, index)
 
-            noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
+            set_lora_state(self.wan, enabled=False)
+            _, _, _, _, real_video = self.one_step(latents, encoder_hidden_states, guidance_tensor, timesteps, index)
 
-            # run at full precision as autocast and no_grad doesn't work well together 
-            pred_fake_noise = predict_noise(
-                self.fake_unet, noisy_latents, text_embedding, uncond_embedding, 
-                timesteps, guidance_scale=self.fake_guidance_scale,
-                unet_added_conditions=unet_added_conditions,
-                uncond_unet_added_conditions=uncond_unet_added_conditions
-            )  
-
-            pred_fake_image = get_x0_from_noise(
-                noisy_latents.double(), pred_fake_noise.double(), self.alphas_cumprod.double(), timesteps
-            )
-
-            if self.use_fp16:
-                if self.sdxl:
-                    bf16_unet_added_conditions = {} 
-                    bf16_uncond_unet_added_conditions = {} 
-
-                    for k,v in unet_added_conditions.items():
-                        bf16_unet_added_conditions[k] = v.to(torch.bfloat16)
-                    for k,v in uncond_unet_added_conditions.items():
-                        bf16_uncond_unet_added_conditions[k] = v.to(torch.bfloat16)
-                else:
-                    bf16_unet_added_conditions = unet_added_conditions 
-                    bf16_uncond_unet_added_conditions = uncond_unet_added_conditions
-
-                pred_real_noise = predict_noise(
-                    self.real_unet, noisy_latents.to(torch.bfloat16), text_embedding.to(torch.bfloat16), 
-                    uncond_embedding.to(torch.bfloat16), 
-                    timesteps, guidance_scale=self.real_guidance_scale,
-                    unet_added_conditions=bf16_unet_added_conditions,
-                    uncond_unet_added_conditions=bf16_uncond_unet_added_conditions
-                ) 
-            else:
-                pred_real_noise = predict_noise(
-                    self.real_unet, noisy_latents, text_embedding, uncond_embedding, 
-                    timesteps, guidance_scale=self.real_guidance_scale,
-                    unet_added_conditions=unet_added_conditions,
-                    uncond_unet_added_conditions=uncond_unet_added_conditions
-                )
-
-            pred_real_image = get_x0_from_noise(
-                noisy_latents.double(), pred_real_noise.double(), self.alphas_cumprod.double(), timesteps
-            )     
-
-            p_real = (latents - pred_real_image)
-            p_fake = (latents - pred_fake_image)
+            p_real = (latents - real_video)
+            p_fake = (latents - fake_video)
 
             grad = (p_real - p_fake) / torch.abs(p_real).mean(dim=[1, 2, 3], keepdim=True) 
             grad = torch.nan_to_num(grad)
@@ -239,9 +136,8 @@ class WanGuidance(nn.Module):
         }
 
         dm_log_dict = {
-            "dmtrain_noisy_latents": noisy_latents.detach().float(),
-            "dmtrain_pred_real_image": pred_real_image.detach().float(),
-            "dmtrain_pred_fake_image": pred_fake_image.detach().float(),
+            "dmtrain_pred_real_video": real_video.detach().float(),
+            "dmtrain_pred_fake_video": fake_video.detach().float(),
             "dmtrain_grad": grad.detach().float(),
             "dmtrain_gradient_norm": torch.norm(grad).item()
         }
@@ -251,39 +147,26 @@ class WanGuidance(nn.Module):
     def compute_loss_fake(
         self,
         latents,
-        text_embedding,
+        encoder_hidden_states,
         uncond_embedding,
-        unet_added_conditions=None,
-        uncond_unet_added_conditions=None
+        guidance_tensor
     ):
-        if self.gradient_checkpointing:
-            self.fake_unet.enable_gradient_checkpointing()
+        # if self.gradient_checkpointing:
+        #     self.fake_unet.enable_gradient_checkpointing()
         latents = latents.detach()
-        batch_size = latents.shape[0]
-        noise = torch.randn_like(latents)
 
-        timesteps = torch.randint(
-            0,
-            self.num_train_timesteps,
-            [batch_size], 
+        index = torch.randint(
+            0,self.args.denoising_timestep-1,
+            [1], 
             device=latents.device,
             dtype=torch.long
         )
-        noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
+        if self.args.sp_size > 1:
+            broadcast(index)
+        timesteps = self.scheduler.timesteps[index]
 
-        with self.network_context_manager:
-            fake_noise_pred = predict_noise(
-                self.fake_unet, noisy_latents, text_embedding, uncond_embedding,
-                timesteps, guidance_scale=1, # no guidance for training dfake 
-                unet_added_conditions=unet_added_conditions,
-                uncond_unet_added_conditions=uncond_unet_added_conditions
-            )
-
-        fake_noise_pred = fake_noise_pred.float()
-
-        fake_x0_pred = get_x0_from_noise(
-            noisy_latents.double(), fake_noise_pred.double(), self.alphas_cumprod.double(), timesteps
-        )
+        set_lora_state(self.wan, enabled=True)
+        fake_dist_predict, fake_noise_pred, noisy_latents, noise, model_pred_x0 = self.one_step(latents, encoder_hidden_states, guidance_tensor,timesteps, index)
 
         # epsilon prediction loss 
         loss_fake = torch.mean(
@@ -297,89 +180,98 @@ class WanGuidance(nn.Module):
         fake_log_dict = {
             "faketrain_latents": latents.detach().float(),
             "faketrain_noisy_latents": noisy_latents.detach().float(),
-            "faketrain_x0_pred": fake_x0_pred.detach().float()
+            "faketrain_x0_pred": model_pred_x0.detach().float()
         }
-        if self.gradient_checkpointing:
-            self.fake_unet.disable_gradient_checkpointing()
+        # if self.gradient_checkpointing:
+        #     self.fake_unet.disable_gradient_checkpointing()
         return loss_dict, fake_log_dict
 
-    def compute_generator_clean_cls_loss(self, 
-        fake_image, text_embedding, 
-        unet_added_conditions=None
-    ):
+    def compute_generator_clean_cls_loss(self, video, encoder_hidden_states, guidance_tensor):
         loss_dict = {} 
 
-        pred_realism_on_fake_with_grad = self.compute_cls_logits(
-            fake_image, 
-            text_embedding=text_embedding, 
-            unet_added_conditions=unet_added_conditions
+        logits = self.compute_cls_logits(
+            video, encoder_hidden_states, guidance_tensor
         )
-        loss_dict["gen_cls_loss"] = F.softplus(-pred_realism_on_fake_with_grad).mean()
+
+        loss_dict["gen_cls_loss"] = F.softplus(-logits).mean()
         return loss_dict 
 
     def generator_forward(
         self,
-        image,
-        text_embedding,
+        video,
+        encoder_hidden_states,
         uncond_embedding,
-        unet_added_conditions=None,
-        uncond_unet_added_conditions=None
+        guidance_tensor
     ):
         loss_dict = {}
         log_dict = {}
 
-        # image.requires_grad_(True)
+        # video.requires_grad_(True)
         if not self.gan_alone:
             dm_dict, dm_log_dict = self.compute_distribution_matching_loss(
-                image, text_embedding, uncond_embedding, 
-                unet_added_conditions, uncond_unet_added_conditions
-            )
+                video, encoder_hidden_states, uncond_embedding, guidance_tensor)
 
             loss_dict.update(dm_dict)
             log_dict.update(dm_log_dict)
 
+            # print(f"finished dm loss, {loss_dict}, {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024}GB")
+
         if self.cls_on_clean_image:
             clean_cls_loss_dict = self.compute_generator_clean_cls_loss(
-                image, text_embedding, unet_added_conditions
+                video, encoder_hidden_states, guidance_tensor
             )
             loss_dict.update(clean_cls_loss_dict)
 
-        # cls_loss_grad = torch.autograd.grad(
-        #     loss_dict["gen_cls_loss"], image, retain_graph=True
-        # )[0]
-
-        # dm_loss_grad = torch.autograd.grad(
-        #     loss_dict["loss_dm"], image, retain_graph=True
-        # )[0]
-
-        # if self.accelerator.is_main_process:
-        #     print("cls_loss_grad", cls_loss_grad.abs().mean().item())
-        #     print("dm_loss_grad", dm_loss_grad.abs().mean().item())
-
-        # import pdb; pdb.set_trace()
+            # print(f"finished cls loss, {loss_dict}, {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024}GB")
 
         return loss_dict, log_dict 
 
+    def compute_cls_logits(self, video, encoder_hidden_states, guidance_tensor):
+        with self.network_context_manager:
+            if self.diffusion_gan:
+                index = torch.randint(
+                    0, self.diffusion_gan_max_timestep, [video.shape[0]], device=video.device, dtype=torch.long
+                )
+                index = index.to(video.device)
+                if self.args.sp_size > 1:
+                    broadcast(index)
+                timesteps = self.scheduler.timesteps[index]
+                noise = torch.randn_like(video)
+                if self.args.sp_size > 1:
+                    broadcast(noise)
+                nosiy_video = self.scheduler.add_noise(video, noise, timesteps)
+            else:
+                timesteps = torch.zeros([video.shape[0]], dtype=torch.long, device=video.device)
+
+            x = [nosiy_video[i] for i in range(nosiy_video.size(0))]
+
+            set_lora_state(self.wan, enabled=True)
+            rep = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor,classify_mode=True)
+
+            # logits = checkpoint(self.cls_pred_branch, rep, use_reentrant=False).squeeze(dim=1)
+            logits = self.cls_pred_branch(rep).squeeze(dim=1)
+
+        return logits
+
     def compute_guidance_clean_cls_loss(
             self, real_image, fake_image, 
-            real_text_embedding, fake_text_embedding,
-            real_unet_added_conditions=None, 
-            fake_unet_added_conditions=None
+            real_text_embedding, fake_text_embedding, guidance_tensor
         ):
         pred_realism_on_real = self.compute_cls_logits(
             real_image.detach(), 
-            text_embedding=real_text_embedding,
-            unet_added_conditions=real_unet_added_conditions
+            encoder_hidden_states=real_text_embedding,
+            guidance_tensor=guidance_tensor
         )
         pred_realism_on_fake = self.compute_cls_logits(
             fake_image.detach(), 
-            text_embedding=fake_text_embedding,
-            unet_added_conditions=fake_unet_added_conditions
+            encoder_hidden_states=fake_text_embedding,
+            guidance_tensor=guidance_tensor
         )
 
         log_dict = {
-            "pred_realism_on_real": torch.sigmoid(pred_realism_on_real).squeeze(dim=1).detach(),
-            "pred_realism_on_fake": torch.sigmoid(pred_realism_on_fake).squeeze(dim=1).detach()
+            "real_video_for_cls": real_image.detach(),
+            "pred_realism_on_real": torch.sigmoid(pred_realism_on_real).detach(),
+            "pred_realism_on_fake": torch.sigmoid(pred_realism_on_fake).detach()
         }
 
         classification_loss = F.softplus(pred_realism_on_fake).mean() + F.softplus(-pred_realism_on_real).mean()
@@ -390,34 +282,32 @@ class WanGuidance(nn.Module):
 
     def guidance_forward(
         self,
-        image,
-        text_embedding,
+        video,
+        encoder_hidden_states,
         uncond_embedding,
-        real_train_dict=None,
-        unet_added_conditions=None,
-        uncond_unet_added_conditions=None
+        guidance_tensor,
+        real_train_dict
     ):
         fake_dict, fake_log_dict = self.compute_loss_fake(
-            image, text_embedding, uncond_embedding,
-            unet_added_conditions=unet_added_conditions,
-            uncond_unet_added_conditions=uncond_unet_added_conditions
-        )
+            video, encoder_hidden_states, uncond_embedding, guidance_tensor)
 
         loss_dict = fake_dict 
         log_dict = fake_log_dict
 
+        # print(f"finished fake loss, {fake_dict}, {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024}GB")
+
         if self.cls_on_clean_image:
             clean_cls_loss_dict, clean_cls_log_dict = self.compute_guidance_clean_cls_loss(
-                real_image=real_train_dict['images'], 
-                fake_image=image,
-                real_text_embedding=real_train_dict['text_embedding'],
-                fake_text_embedding=text_embedding, 
-                real_unet_added_conditions=real_train_dict['unet_added_conditions'],
-                fake_unet_added_conditions=unet_added_conditions
+                real_image=real_train_dict['latents'], 
+                fake_image=video,
+                real_text_embedding=real_train_dict['encoder_hidden_states'],
+                fake_text_embedding=encoder_hidden_states, 
+                guidance_tensor=guidance_tensor
             )
             loss_dict.update(clean_cls_loss_dict)
             log_dict.update(clean_cls_log_dict)
 
+        # print(f"finished guidance_forward, {clean_cls_loss_dict}, {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024}GB")
         return loss_dict, log_dict 
 
     def forward(
@@ -429,20 +319,18 @@ class WanGuidance(nn.Module):
     ):    
         if generator_turn:
             loss_dict, log_dict = self.generator_forward(
-                image=generator_data_dict["image"],
-                text_embedding=generator_data_dict["text_embedding"],
+                video=generator_data_dict["video"],
+                encoder_hidden_states=generator_data_dict["encoder_hidden_states"],
                 uncond_embedding=generator_data_dict["uncond_embedding"],
-                unet_added_conditions=generator_data_dict["unet_added_conditions"],
-                uncond_unet_added_conditions=generator_data_dict["uncond_unet_added_conditions"]
+                guidance_tensor=generator_data_dict["guidance_tensor"]
             )   
         elif guidance_turn:
             loss_dict, log_dict = self.guidance_forward(
-                image=guidance_data_dict["image"],
-                text_embedding=guidance_data_dict["text_embedding"],
+                video=guidance_data_dict["video"],
+                encoder_hidden_states=guidance_data_dict["encoder_hidden_states"],
                 uncond_embedding=guidance_data_dict["uncond_embedding"],
+                guidance_tensor=guidance_data_dict["guidance_tensor"],
                 real_train_dict=guidance_data_dict["real_train_dict"],
-                unet_added_conditions=guidance_data_dict["unet_added_conditions"],
-                uncond_unet_added_conditions=guidance_data_dict["uncond_unet_added_conditions"]
             ) 
         else:
             raise NotImplementedError

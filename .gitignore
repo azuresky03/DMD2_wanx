@@ -183,3 +183,5 @@ ignored_cache
 
 *.jpg
 *.png
+outputs
+exp_results

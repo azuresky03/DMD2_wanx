@@ -1,0 +1,8 @@
+distributed_type: FSDP
+fsdp_config:
+  sharding_strategy: 1              
+  min_num_params: 1e8    
+  fsdp_offload_params: true       
+  cpu_offload: true           
+num_machines: 1
+num_processes: 8

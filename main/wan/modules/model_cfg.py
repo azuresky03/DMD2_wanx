@@ -4,12 +4,71 @@ import math
 import torch
 import torch.amp as amp
 import torch.nn as nn
+import torch.distributed as dist
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+from fastvideo.models.wan.modules.attention import flash_attention
 
-__all__ = ['WanModel']
+from fastvideo.utils.parallel_states import get_sequence_parallel_state, nccl_info
+from fastvideo.utils.communications import all_gather, all_to_all_4D
+
+__all__ = ['WanModelCFG']
+
+def pad_freqs(original_tensor, target_len):
+    seq_len, s1, s2 = original_tensor.shape
+    pad_size = target_len - seq_len
+    padding_tensor = torch.ones(
+        pad_size,
+        s1,
+        s2,
+        dtype=original_tensor.dtype,
+        device=original_tensor.device)
+    padded_tensor = torch.cat([original_tensor, padding_tensor], dim=0)
+    return padded_tensor
+
+
+@amp.autocast("cuda",enabled=False)
+def rope_apply_dist(x, grid_sizes, freqs):
+    """
+    x:          [B, L, N, C].
+    grid_sizes: [B, 3].
+    freqs:      [M, C // 2].
+    """
+    s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    # split freqs
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    # loop over samples
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        # precompute multipliers
+        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
+            s, n, -1, 2))
+        freqs_i = torch.cat([
+            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ],
+                            dim=-1).reshape(seq_len, 1, -1)
+
+        # apply rotary embedding
+        # sp_size = get_sequence_parallel_world_size() 
+        # sp_rank = get_sequence_parallel_rank()
+        sp_size = nccl_info.sp_size
+        sp_rank = nccl_info.rank_within_group
+        freqs_i = pad_freqs(freqs_i, s * sp_size)
+        s_per_rank = s
+        freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
+                                                       s_per_rank), :, :]
+        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
+        x_i = torch.cat([x_i, x[i, s:]])
+
+        # append to collection
+        output.append(x_i)
+    return torch.stack(output).float()
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -99,6 +158,11 @@ class WanLayerNorm(nn.LayerNorm):
         return super().forward(x.float()).type_as(x)
 
 
+def shrink_head(encoder_state, dim):
+    local_heads = encoder_state.shape[dim] // nccl_info.sp_size
+    return encoder_state.narrow(dim, nccl_info.rank_within_group * local_heads, local_heads)
+
+
 class WanSelfAttention(nn.Module):
 
     def __init__(self,
@@ -133,6 +197,7 @@ class WanSelfAttention(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        rank = dist.get_rank()
 
         # query, key, value function
         def qkv_fn(x):
@@ -143,18 +208,30 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        if get_sequence_parallel_state():
+            q = rope_apply_dist(q, grid_sizes, freqs)
+            k = rope_apply_dist(k, grid_sizes, freqs)
+        else:
+            q = rope_apply(q, grid_sizes, freqs)
+            k = rope_apply(k, grid_sizes, freqs)
+
+        if get_sequence_parallel_state():
+            q = all_to_all_4D(q, scatter_dim=2, gather_dim=1)
+            k = all_to_all_4D(k, scatter_dim=2, gather_dim=1)
+            v = all_to_all_4D(v, scatter_dim=2, gather_dim=1)
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
+            q=q,
+            k=k,
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
+        if get_sequence_parallel_state():
+            x = all_to_all_4D(x, scatter_dim=1, gather_dim=2)
 
         # output
         x = x.flatten(2)
         x = self.o(x)
         return x
-
 
 class WanT2VCrossAttention(WanSelfAttention):
 
@@ -172,8 +249,15 @@ class WanT2VCrossAttention(WanSelfAttention):
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
 
+        if get_sequence_parallel_state():
+        # batch_size, seq_len, attn_heads, head_dim
+            q = all_to_all_4D(q, scatter_dim=2, gather_dim=1)
+            k = shrink_head(k, dim=2)
+            v = shrink_head(v, dim=2)
         # compute attention
         x = flash_attention(q, k, v, k_lens=context_lens)
+        if get_sequence_parallel_state():
+            x = all_to_all_4D(x, scatter_dim=1, gather_dim=2)
 
         # output
         x = x.flatten(2)
@@ -213,9 +297,22 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
+    
+        if get_sequence_parallel_state():
+        # batch_size, seq_len, attn_heads, head_dim
+            q = all_to_all_4D(q, scatter_dim=2, gather_dim=1)
+            k = shrink_head(k, dim=2)
+            v = shrink_head(v, dim=2)
+            k_img = shrink_head(k_img, dim=2)
+            v_img = shrink_head(v_img, dim=2)
+
         img_x = flash_attention(q, k_img, v_img, k_lens=None)
         # compute attention
         x = flash_attention(q, k, v, k_lens=context_lens)
+
+        if get_sequence_parallel_state():
+            img_x = all_to_all_4D(img_x, scatter_dim=1, gather_dim=2)
+            x = all_to_all_4D(x, scatter_dim=1, gather_dim=2)
 
         # output
         x = x.flatten(2)
@@ -358,7 +455,7 @@ class MLPProj(torch.nn.Module):
         return clip_extra_context_tokens
 
 
-class WanModel(ModelMixin, ConfigMixin):
+class WanModelCFG(ModelMixin, ConfigMixin):
     r"""
     Wan diffusion backbone supporting both text-to-video and image-to-video.
     """
@@ -532,6 +629,7 @@ class WanModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
         # params
@@ -547,8 +645,9 @@ class WanModel(ModelMixin, ConfigMixin):
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
+
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        # print(f"max seq_lens {seq_lens.max()}")
+
         assert seq_lens.max() <= seq_len
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
@@ -569,7 +668,7 @@ class WanModel(ModelMixin, ConfigMixin):
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
-        # context
+
         context_lens = None
         if context is not None:
             context = self.text_embedding(
@@ -595,15 +694,17 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens)
 
-        # i = 0
+        x = torch.chunk(x, nccl_info.sp_size, dim=1)[nccl_info.rank_within_group]
+
         for block in self.blocks:
-            # print(f"device{device} block {i}")
             x = block(x, **kwargs)
-            # i+=1
+
+        if get_sequence_parallel_state():
+            x = all_gather(x,dim=1).contiguous()
 
         if classify_mode:
             return x
-        
+
         # head
         x = self.head(x, e)
 

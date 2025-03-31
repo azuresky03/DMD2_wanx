@@ -1,12 +1,14 @@
 import matplotlib
 matplotlib.use('Agg')
 from main.utils import prepare_images_for_saving, draw_valued_array, draw_probability_histogram
-from main.sd_image_dataset import SDImageDatasetLMDB
-from transformers import CLIPTokenizer, AutoTokenizer
 from accelerate.utils import ProjectConfiguration
 from diffusers.optimization import get_scheduler
-from main.utils import SDTextDataset, cycle 
-from main.sd_unified_model import SDUniModel
+from main.utils import cycle 
+from main.wan_unified_model import WanUniModel
+from main.wan.modules.lora import set_lora_state
+from fastvideo.dataset.latent_datasets import (LatentDataset, latent_collate_function)
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
 from accelerate.utils import set_seed
 from accelerate import Accelerator
 from torch.distributed.fsdp import (
@@ -20,6 +22,7 @@ import wandb
 import torch 
 import time 
 import os
+from time import sleep
 
 class Trainer:
     def __init__(self, args):
@@ -31,11 +34,9 @@ class Trainer:
         accelerator_project_config = ProjectConfiguration(logging_dir=args.log_path)
         accelerator = Accelerator(
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            mixed_precision="no",
-            log_with="wandb",
+            # mixed_precision="no",
             project_config=accelerator_project_config,
             kwargs_handlers=None,
-            dispatch_batches=False
         )
         set_seed(args.seed + accelerator.process_index)
 
@@ -52,19 +53,19 @@ class Trainer:
 
             os.makedirs(args.log_path, exist_ok=True)
 
-            run = wandb.init(config=args, dir=args.log_path, **{"mode": "online", "entity": args.wandb_entity, "project": args.wandb_project})
-            wandb.run.log_code(".")
-            wandb.run.name = args.wandb_name
-            print(f"run dir: {run.dir}")
-            self.wandb_folder = run.dir
-            os.makedirs(self.wandb_folder, exist_ok=True)
+            # run = wandb.init(config=args, dir=args.log_path, **{"mode": "online", "entity": args.wandb_entity, "project": args.wandb_project})
+            # wandb.run.log_code(".")
+            # wandb.run.name = args.wandb_name
+            # print(f"run dir: {run.dir}")
+            # self.wandb_folder = run.dir
+            # os.makedirs(self.wandb_folder, exist_ok=True)
 
-        self.model = SDUniModel(args, accelerator)
+        self.model = WanUniModel(args, accelerator).to("cpu")
+        if accelerator.is_main_process:
+            print("WanUniModel loaded !!!")
         self.max_grad_norm = args.max_grad_norm
         self.denoising = args.denoising
         self.step = 0 
-
-        if self.denoising: assert args.sdxl, "denoising only supported for sdxl." 
 
         if args.ckpt_only_path is not None:
             if accelerator.is_main_process:
@@ -81,65 +82,23 @@ class Trainer:
                 print(f"loading generator ckpt from {args.generator_ckpt_path}")
             print(self.model.feedforward_model.load_state_dict(torch.load(args.generator_ckpt_path, map_location="cpu"), strict=True))
 
-        self.sdxl = args.sdxl 
-        
-        if self.sdxl:
-            tokenizer_one = AutoTokenizer.from_pretrained(
-                args.model_id, subfolder="tokenizer", revision=args.revision, use_fast=False
-            )
+        dataset = LatentDataset(args.data_json_path, args.num_latent_t, -1)
 
-            tokenizer_two = AutoTokenizer.from_pretrained(
-                args.model_id, subfolder="tokenizer_2", revision=args.revision, use_fast=False
-            )
+        dataloader = DataLoader(
+            dataset,
+            collate_fn=latent_collate_function,
+            pin_memory=True,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            drop_last=True,
+        )
 
-            dataset = SDTextDataset(
-                args.train_prompt_path, 
-                is_sdxl=True,
-                tokenizer_one=tokenizer_one,
-                tokenizer_two=tokenizer_two
-            )  
-
-            # also load the training dataset images, this will be useful for GAN loss 
-            real_dataset = SDImageDatasetLMDB(
-                args.real_image_path, 
-                is_sdxl=True,
-                tokenizer_one=tokenizer_one,
-                tokenizer_two=tokenizer_two
-            )
-        else:        
-            tokenizer = CLIPTokenizer.from_pretrained(
-                args.model_id, subfolder="tokenizer"
-            )
-            uncond_input_ids = tokenizer(
-                [""], max_length=tokenizer.model_max_length, 
-                return_tensors="pt", padding="max_length", truncation=True
-            ).input_ids.to(accelerator.device)
-
-            dataset = SDTextDataset(args.train_prompt_path, tokenizer, is_sdxl=False)
-            self.uncond_embedding = self.model.text_encoder(uncond_input_ids)[0]
-
-            # also load the training dataset images, this will be useful for GAN loss 
-            real_dataset = SDImageDatasetLMDB(
-                args.real_image_path, 
-                is_sdxl=False,
-                tokenizer_one=tokenizer
-            )
-
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
         dataloader = accelerator.prepare(dataloader)
         self.dataloader = cycle(dataloader)
 
-        real_dataloader = torch.utils.data.DataLoader(
-            real_dataset, num_workers=args.num_workers, 
-            batch_size=args.batch_size, shuffle=True, 
-            drop_last=True
-        )
-        real_dataloader = accelerator.prepare(real_dataloader)
-        self.real_dataloader = cycle(real_dataloader)
-
         # use two dataloader 
         # as the generator and guidance model are trained at different paces 
-        guidance_dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        guidance_dataloader = torch.utils.data.DataLoader(dataset,collate_fn=latent_collate_function, batch_size=args.batch_size, shuffle=True, drop_last=True)
         guidance_dataloader = accelerator.prepare(guidance_dataloader)
         self.guidance_dataloader = cycle(guidance_dataloader)
 
@@ -152,7 +111,8 @@ class Trainer:
 
         if self.denoising:
             denoising_dataloader = torch.utils.data.DataLoader(
-                real_dataset, num_workers=args.num_workers, 
+                dataset, num_workers=args.num_workers, 
+                collate_fn=latent_collate_function,
                 batch_size=args.batch_size, shuffle=True, 
                 drop_last=True
             )
@@ -167,6 +127,9 @@ class Trainer:
             generator_path = os.path.join(args.output_path, f"checkpoint_model_{self.step:06d}", "pytorch_model.bin")
             guidance_path = os.path.join(args.output_path, f"checkpoint_model_{self.step:06d}", "pytorch_model_1.bin")
 
+
+            accelerator.print(f"generator_path: {generator_path}")
+            accelerator.print(f"guidance_path: {guidance_path}")
             if accelerator.is_main_process:
                 print(f"Saving current model to {args.output_path} to fix fsdp hybrid sharding's parameter mismatch across nodes")
                 os.makedirs(os.path.join(args.output_path, f"checkpoint_model_{self.step:06d}"), exist_ok=True)
@@ -176,16 +139,36 @@ class Trainer:
             accelerator.wait_for_everyone()
             generator_path = os.path.join(args.output_path, f"checkpoint_model_{self.step:06d}", "pytorch_model.bin")
             guidance_path = os.path.join(args.output_path, f"checkpoint_model_{self.step:06d}", "pytorch_model_1.bin")
-            print(self.model.feedforward_model.load_state_dict(torch.load(generator_path, map_location="cpu"), strict=True))
-            print(self.model.guidance_model.load_state_dict(torch.load(guidance_path, map_location="cpu"), strict=True))
+            print(self.model.feedforward_model.load_state_dict(torch.load(generator_path, map_location="cpu",weights_only=True), strict=True),"generator")
+            result = self.model.guidance_model.load_state_dict(torch.load(guidance_path, map_location="cpu",weights_only=True), strict=True)
+            accelerator.wait_for_everyone()
 
             if accelerator.is_main_process:
                 print("reloading done")
+        torch.cuda.empty_cache()
 
         if self.fsdp:
+            accelerator.print("FSDP: prepare model in accelerator")
+            from main.wan.modules.model import WanAttentionBlock
+            def custom_auto_wrap_policy(module,**kwargs):
+                print(f"encounter {module} in fsdp")
+                if isinstance(module, WanAttentionBlock):  # 仅分片 TransformerBlock 类
+                    print(f"wrap {module} in fsdp")
+                    return True
+                return False  # 其他模块不分片
+            # 配置 Accelerate 的 FSDP 参数
+            accelerator.state.fsdp_plugin.auto_wrap_policy = custom_auto_wrap_policy
+
             # the self.model is not wrapped in fsdp, only its two subnetworks are wrapped 
-            self.model.feedforward_model, self.model.guidance_model = accelerator.prepare(
-                self.model.feedforward_model, self.model.guidance_model
+            print(f"BEFORE max memory allocated: {torch.cuda.max_memory_allocated()}")
+            self.model.guidance_model = accelerator.prepare(
+                self.model.guidance_model
+            )
+            print(f"AFTER max memory allocated: {torch.cuda.max_memory_allocated()}")
+            sleep(100)
+            torch.cuda.empty_cache()
+            self.model.feedforward_model = accelerator.prepare(
+                self.model.feedforward_model
             )
 
         self.optimizer_generator = torch.optim.AdamW(
@@ -225,6 +208,7 @@ class Trainer:
             ) 
         else:
             # the self.model is not wrapped in ddp, only its two subnetworks are wrapped 
+            accelerator.print("preparing model in accelerator")
             (
                 self.model.feedforward_model, self.model.guidance_model, self.optimizer_generator,
                 self.optimizer_guidance, self.scheduler_generator, self.scheduler_guidance 
@@ -251,6 +235,8 @@ class Trainer:
 
         if args.checkpoint_path is not None:
             self.load(args.checkpoint_path)
+
+        self.null_encoded = torch.load(args.null_encoded_path, map_location="cpu",weights_only=True)
 
     def fsdp_state_dict(self, model):
         fsdp_fullstate_save_policy = FullStateDictConfig(
@@ -325,21 +311,16 @@ class Trainer:
         accelerator = self.accelerator
 
         # 4 channel for SD-VAE, please adapt for other autoencoders 
-        noise = torch.randn(self.batch_size, self.latent_channel, self.latent_resolution, self.latent_resolution, device=accelerator.device)
         visual = self.step % self.wandb_iters == 0
         COMPUTE_GENERATOR_GRADIENT = self.step % self.dfake_gen_update_ratio == 0
 
         if COMPUTE_GENERATOR_GRADIENT:
-            text_embedding = next(self.dataloader)
+            latents, encoder_hidden_states, latents_attention_mask, encoder_attention_mask = next(self.dataloader)
         else:
-            text_embedding = next(self.guidance_dataloader) 
+            latents, encoder_hidden_states, latents_attention_mask, encoder_attention_mask = next(self.guidance_dataloader) 
+        noise = torch.rand_like(latents, device=accelerator.device)
 
-        if self.sdxl:
-            # SDXL uses zero as the uncond_embedding
-            uncond_embedding = None 
-        else:
-            text_embedding = text_embedding['text_input_ids_one'].squeeze(1) # actually it is tokenized text prompts
-            uncond_embedding = self.uncond_embedding.repeat(len(text_embedding), 1, 1)
+        uncond_embedding = self.null_encoded.to(accelerator.device)
 
         if self.denoising:
             denoising_dict = next(self.denoising_dataloader)
@@ -353,7 +334,7 @@ class Trainer:
 
         # generate images and optionaly compute the generator gradient
         generator_loss_dict, generator_log_dict = self.model(
-            noise, text_embedding, uncond_embedding, 
+            noise, encoder_hidden_states, uncond_embedding, 
             visual=visual, denoising_dict=denoising_dict,
             compute_generator_gradient=COMPUTE_GENERATOR_GRADIENT,
             real_train_dict=real_train_dict,
@@ -628,7 +609,7 @@ def parse_args():
     parser.add_argument("--wandb_entity", type=str)
     parser.add_argument("--wandb_project", type=str)
     parser.add_argument("--wandb_iters", type=int, default=100)
-    parser.add_argument("--wandb_name", type=str, required=True)
+    parser.add_argument("--wandb_name", type=str, default=None)
     parser.add_argument("--max_grad_norm", type=float, default=10.0, help="max grad norm for network")
     parser.add_argument("--warmup_step", type=int, default=500, help="warmup step for network")
     parser.add_argument("--min_step_percent", type=float, default=0.02, help="minimum step percent for training")
@@ -680,6 +661,12 @@ def parse_args():
     parser.add_argument("--lora_rank", type=int, default=64)
     parser.add_argument("--lora_alpha", type=float, default=8)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
+
+    parser.add_argument("--lora_scale", type=float, default=1)
+    parser.add_argument("--shift", type=float, default=5)
+    parser.add_argument("--data_json_path", type=str, required=True)
+    parser.add_argument("--num_latent_t", type=int, default=21, help="Number of latent timesteps.")
+    parser.add_argument("--null_encoded_path",type=str,default="/vepfs-zulution/zhangpengpeng/cv/video_generation/Wan2.1/data/mixkit/meta/null.pt",help="The path to the null encoded path.")
     
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -699,4 +686,4 @@ if __name__ == "__main__":
 
     trainer = Trainer(args)
 
-    trainer.train()
+    # trainer.train()

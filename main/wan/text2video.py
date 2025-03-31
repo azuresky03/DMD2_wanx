@@ -15,7 +15,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
-from .modules.model import WanModel
+from .modules.model_cfg import WanModelCFG
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
 from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
@@ -35,6 +35,7 @@ class WanT2V:
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        ckp_dir = None
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -80,9 +81,15 @@ class WanT2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        cfg_org_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/Wan2.1/data/outputs/exp15_distill_cfg_sequence_parallel/checkpoint-200"
+        self.model = WanModelCFG.from_pretrained(cfg_org_dir)
+        logging.info(f"Created WanModel from {cfg_org_dir}")
         self.model.eval().requires_grad_(False)
+
+        if ckp_dir:
+            self.model.load_state_dict(torch.load(ckp_dir, map_location=self.device
+            ))
+            logging.info(f"Loaded model from {ckp_dir}")
 
         if use_usp:
             from xfuser.core.distributed import \
@@ -233,13 +240,24 @@ class WanT2V:
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                if not hasattr(self.model,"guidance_embedding") and guide_scale!=1:
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0].to(
+                            torch.device('cpu') if offload_model else self.device)
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0].to(
+                            torch.device('cpu') if offload_model else self.device)
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
+                    assert False
+                else:
+                    assert self.model.guidance_embedding is not None
+                    guidance_tensor = torch.tensor([guide_scale*1000],
+                        device=latent_model_input[0].device,
+                        dtype=torch.bfloat16)
+                    noise_pred = self.model(
+                        latent_model_input, t=timestep,guidance=guidance_tensor, **arg_c)[0].to(
+                            torch.device('cpu') if offload_model else self.device)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),

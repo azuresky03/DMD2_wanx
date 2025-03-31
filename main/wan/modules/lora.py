@@ -25,19 +25,41 @@ class LoRALayer(nn.Module):
         # 原始层的输出
         original_output = self.layer(x)
         
+        # print(f"x shape: {x.shape}, original_output shape: {original_output.shape} layer weight shape: {self.layer.weight.shape}")
+        
         # 只有在enabled为True时才应用LoRA
         if self.enabled:
-            # Compute the low-rank adaptation
-            lora_output = (self.lora_A @ self.lora_B) @ x
-            # Scale the output and add to original
+            # 保存原始形状信息
+            original_shape = x.shape
+            
+            if len(original_shape) == 3:
+                # 三维输入: [batch_size, seq_len, hidden_dim]
+                batch_size, seq_len, hidden_dim = original_shape
+                
+                # 重塑为二维张量来执行LoRA计算
+                x_2d = x.reshape(-1, hidden_dim)  # [batch_size*seq_len, hidden_dim]
+                
+                # 执行低秩适配
+                lora_output = (x_2d @ self.lora_B.T) @ self.lora_A.T
+                
+                # 重塑回原始形状
+                lora_output = lora_output.reshape(batch_size, seq_len, -1)
+                
+            else:
+                # 对于二维输入保持原有逻辑
+                lora_output = x @ self.lora_B.T @ self.lora_A.T
+            
+            # 缩放输出并添加到原始输出
             return original_output + self.scale * lora_output
         else:
             # 不使用LoRA，直接返回原始输出
             return original_output
 
-    def set_lora_enabled(self, enabled=True):
+    def set_lora_enabled(self, enabled=True,scale=None):
         """设置是否启用LoRA"""
         self.enabled = enabled
+        if scale is not None:
+            self.scale = scale
 
 
 def apply_lora_to_wanx(model, rank=4, scale=1.0):
@@ -49,7 +71,12 @@ def apply_lora_to_wanx(model, rank=4, scale=1.0):
     count = 0
     for name, module in modules_to_replace:
         lora_layer = LoRALayer(module, rank, scale)
-        setattr(model, name, lora_layer)
+        # 正确处理嵌套模块
+        name_parts = name.split('.')
+        parent_module = model
+        for part in name_parts[:-1]:
+            parent_module = getattr(parent_module, part)
+        setattr(parent_module, name_parts[-1], lora_layer)
         count += 1
     print(f'Applied LoRA to {count} layers')
     
@@ -57,7 +84,7 @@ def apply_lora_to_wanx(model, rank=4, scale=1.0):
 
 
 # 新增：在整个模型范围内设置LoRA状态
-def set_lora_state(model, enabled=True):
+def set_lora_state(model, enabled=True, requires_grad=None, scale=None):
     """
     在整个模型中设置所有LoRA层的状态
     
@@ -68,11 +95,15 @@ def set_lora_state(model, enabled=True):
     count = 0
     for module in model.modules():
         if isinstance(module, LoRALayer):
-            module.set_lora_enabled(enabled)
+            module.set_lora_enabled(enabled, scale)
+            if requires_grad is not None:
+                module.lora_A.requires_grad = requires_grad
+                module.lora_B.requires_grad = requires_grad
+            module.layer.requires_grad_(False)
             count += 1
     
-    state = "启用" if enabled else "禁用"
-    print(f"已{state} {count} 个LoRA层")
+    # state = "启用" if enabled else "禁用"
+    # print(f"已{state} {count} 个LoRA层")
     return model
 
 

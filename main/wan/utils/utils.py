@@ -35,30 +35,30 @@ def cache_video(tensor,
     # save to cache
     error = None
     for _ in range(retry):
-        try:
+        # try:
             # preprocess
-            tensor = tensor.clamp(min(value_range), max(value_range))
-            tensor = torch.stack([
-                torchvision.utils.make_grid(
-                    u, nrow=nrow, normalize=normalize, value_range=value_range)
-                for u in tensor.unbind(2)
-            ],
-                                 dim=1).permute(1, 2, 3, 0)
-            tensor = (tensor * 255).type(torch.uint8).cpu()
+        tensor = tensor.clamp(min(value_range), max(value_range))
+        tensor = torch.stack([
+            torchvision.utils.make_grid(
+                u, nrow=nrow, normalize=normalize, value_range=value_range)
+            for u in tensor.unbind(2)
+        ],
+                                dim=1).permute(1, 2, 3, 0)
+        tensor = (tensor * 255).type(torch.uint8).cpu()
 
-            # write video
-            writer = imageio.get_writer(
-                cache_file, fps=fps, codec='libx264', quality=8)
-            for frame in tensor.numpy():
-                writer.append_data(frame)
-            writer.close()
-            return cache_file
-        except Exception as e:
-            error = e
-            continue
-    else:
-        print(f'cache_video failed, error: {error}', flush=True)
-        return None
+        # write video
+        writer = imageio.get_writer(
+            cache_file, fps=fps, codec='libx264', quality=8)
+        for frame in tensor.numpy():
+            writer.append_data(frame)
+        writer.close()
+        return cache_file
+    #     except Exception as e:
+    #         error = e
+    #         continue
+    # else:
+    #     print(f'cache_video failed, error: {error}', flush=True)
+    #     return None
 
 
 def cache_image(tensor,
