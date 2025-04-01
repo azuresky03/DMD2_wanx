@@ -299,8 +299,8 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanT2V pipeline.")
-        ckp_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/outputs/exp2/time_0331_1506|34_seed42/checkpoint_model_000119/feedforward.bin"
-        parent_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp2.1/120"
+        ckp_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/outputs/exp3/time_0401_1157|50/checkpoint_model_000079/feedforward.bin"
+        parent_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp3/80"
         wan_t2v = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -319,15 +319,15 @@ def generate(args):
         test_file = "/vepfs-zulution/zhangpengpeng/cv/video_generation/HunyuanVideo/test_prompts.txt"
         with open(test_file, "r") as f:
             lines = f.readlines()
-        for guidance in [3,5,8]:
-            for i in range(3):
-                for shift in [3,5]:
+        for guidance in [5]:
+            for i in range(5):
+                for shift,step in [(3,5)]:
                     if i not in [0,1,5,7,9,10,11]:
                         continue
                     line = lines[i]
                     args.prompt = line.strip()
                     # args.frame_num = frame
-                    args.sample_steps = 5
+                    args.sample_steps = step
                     args.sample_shift = shift
                     args.sample_guide_scale = guidance
                     video = wan_t2v.generate(
@@ -340,7 +340,10 @@ def generate(args):
                         sampling_steps=args.sample_steps,
                         guide_scale=args.sample_guide_scale,
                         seed=args.base_seed,
-                        offload_model=args.offload_model)
+                        offload_model=args.offload_model,
+                        predict_x0=True,
+                        save_mid_dir = f"/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp3/debug_80_x0/{args.prompt[:7]}_shift{args.sample_shift}_step{args.sample_steps}_"
+                        )
 
                     if rank == 0:
                         # if args.save_file is None:

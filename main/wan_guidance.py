@@ -117,8 +117,11 @@ class WanGuidance(nn.Module):
                 broadcast(index)
             timesteps = self.scheduler.timesteps[index]
 
+            uncond_guidance_tensor = torch.tensor([1*1000],
+                                            device=latents.device,
+                                            dtype=torch.bfloat16)
             set_lora_state(self.wan, enabled=True)
-            _, _, _, _, fake_video = self.one_step(latents, encoder_hidden_states, guidance_tensor, timesteps, index)
+            _, _, _, _, fake_video = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor, timesteps, index)
 
             set_lora_state(self.wan, enabled=False)
             _, _, _, _, real_video = self.one_step(latents, encoder_hidden_states, guidance_tensor, timesteps, index)
@@ -165,8 +168,11 @@ class WanGuidance(nn.Module):
             broadcast(index)
         timesteps = self.scheduler.timesteps[index]
 
+        uncond_guidance_tensor = torch.tensor([1*1000],
+                                        device=latents.device,
+                                        dtype=torch.bfloat16)
         set_lora_state(self.wan, enabled=True)
-        fake_dist_predict, fake_noise_pred, noisy_latents, noise, model_pred_x0 = self.one_step(latents, encoder_hidden_states, guidance_tensor,timesteps, index)
+        fake_dist_predict, fake_noise_pred, noisy_latents, noise, model_pred_x0 = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor,timesteps, index)
 
         # epsilon prediction loss 
         loss_fake = torch.mean(
@@ -245,8 +251,11 @@ class WanGuidance(nn.Module):
 
             x = [nosiy_video[i] for i in range(nosiy_video.size(0))]
 
+            uncond_guidance_tensor = torch.tensor([1*1000],
+                                            device=video.device,
+                                            dtype=torch.bfloat16)
             set_lora_state(self.wan, enabled=True)
-            rep = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor,classify_mode=True)
+            rep = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=uncond_guidance_tensor,classify_mode=True)
 
             # logits = checkpoint(self.cls_pred_branch, rep, use_reentrant=False).squeeze(dim=1)
             logits = self.cls_pred_branch(rep).squeeze(dim=1)

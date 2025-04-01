@@ -99,10 +99,10 @@ class Trainer:
         if rank <= 0:
             utc_plus_8 = timezone(timedelta(hours=8))
             current_time = datetime.now(utc_plus_8).strftime("%m%d_%H%M|%S")
-            output_path = os.path.join(args.output_path, f"time_{current_time}_seed{args.seed}")
+            output_path = os.path.join(args.output_path, f"time_{current_time}")
             os.makedirs(output_path, exist_ok=False)
 
-            self.cache_dir = os.path.join(args.cache_dir, f"time_{current_time}_seed{args.seed}")
+            self.cache_dir = os.path.join(args.cache_dir, f"time_{current_time}")
             os.makedirs(self.cache_dir, exist_ok=False)
 
             self.output_path = output_path
@@ -338,19 +338,20 @@ class Trainer:
         device = self.device
 
         # 4 channel for SD-VAE, please adapt for other autoencoders 
-        COMPUTE_GENERATOR_GRADIENT = (self.step+1) % self.dfake_gen_update_ratio == 0
+        COMPUTE_GENERATOR_GRADIENT = self.step % self.dfake_gen_update_ratio == 0
         main_print(f"STEP: {self.step}, COMPUTE_GENERATOR_GRADIENT: {COMPUTE_GENERATOR_GRADIENT}")
 
-        if self.rank == 0:
-            mid = args.cfg
-            a = random.randint(mid-2,mid+3)
-            a_tensor = torch.tensor([a], dtype=torch.float32,device=device)
-        else:
-            a_tensor = torch.tensor([-1], dtype=torch.float32,device=device)
+        # if self.rank == 0:
+        #     mid = args.cfg
+        #     a = random.randint(mid-2,mid+3)
+        #     a_tensor = torch.tensor([a], dtype=torch.float32,device=device)
+        # else:
+        #     a_tensor = torch.tensor([-1], dtype=torch.float32,device=device)
 
-        # 主进程广播 a_tensor 到所有其他进程
-        dist.broadcast(a_tensor, src=0)
-        assert a_tensor[0].item() >0
+        # # 主进程广播 a_tensor 到所有其他进程
+        # dist.broadcast(a_tensor, src=0)
+        # assert a_tensor[0].item() >0
+        a_tensor = torch.tensor([args.cfg], dtype=torch.float32,device=device)
         guidance_cfg = a_tensor[0].item()
         uncond_embedding = self.null_encoded.to(device)
 
@@ -398,7 +399,6 @@ class Trainer:
             if self.debug: main_print(f"backward generator_loss {torch.cuda.max_memory_reserved()/1024**3:.2f} GB")
             generator_grad_norm = clip_grad_norm_(self.model.feedforward_model.parameters(), self.max_grad_norm)
 
-        if COMPUTE_GENERATOR_GRADIENT:
             self.optimizer_generator.step()
             
             # if we also compute gan loss, the classifier may also receive gradient 
@@ -554,8 +554,6 @@ def parse_args():
 
     parser.add_argument("--generator_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=64)
-    parser.add_argument("--lora_alpha", type=float, default=8)
-    parser.add_argument("--lora_dropout", type=float, default=0.0)
 
     parser.add_argument("--lora_scale", type=float, default=1)
     parser.add_argument("--shift", type=float, default=5)

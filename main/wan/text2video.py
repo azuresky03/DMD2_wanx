@@ -22,6 +22,8 @@ from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
+from main.wan.utils.utils import cache_video
+from main.fm_solvers_unipc import FlowUniPCMultistepScheduler as CustomFlowUniPCMultistepScheduler
 
 class WanT2V:
 
@@ -124,7 +126,10 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 save_mid_dir=None,
+                 predict_x0=False,
+                 ):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -210,7 +215,8 @@ class WanT2V:
                 sample_scheduler = FlowUniPCMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,
                     shift=1,
-                    use_dynamic_shifting=False)
+                    use_dynamic_shifting=False) if not predict_x0 else \
+                    CustomFlowUniPCMultistepScheduler()
                 sample_scheduler.set_timesteps(
                     sampling_steps, device=self.device, shift=shift)
                 timesteps = sample_scheduler.timesteps
@@ -233,7 +239,7 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for ind, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
@@ -264,9 +270,22 @@ class WanT2V:
                     t,
                     latents[0].unsqueeze(0),
                     return_dict=False,
-                    generator=seed_g)[0]
+                    generator=seed_g)[0 if not predict_x0 else 1]
                 latents = [temp_x0.squeeze(0)]
 
+                if save_mid_dir:
+                    save_path = save_mid_dir+f"timestep{t}.mp4"
+                    video = self.vae.decode(latents)
+                    cache_video(tensor=video[0][None],save_file=save_path,fps=16,nrow=1,normalize=True,value_range=(-1, 1))
+
+                if t != timesteps[-1] and predict_x0:
+                    tp = timesteps[ind+1].unsqueeze(0).to(dtype=torch.int)
+                    # tp = torch.tensor([timesteps[ind+1],],dtype=torch.int)
+                    print(f"timestep: {t} adding noise, tp: {tp}")
+                    latents = [sample_scheduler.add_noise(
+                        latents[0].unsqueeze(0),
+                        noise[0],
+                        tp,).squeeze(0)]
             x0 = latents
             if offload_model:
                 self.model.cpu()
