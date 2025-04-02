@@ -299,8 +299,8 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanT2V pipeline.")
-        ckp_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/outputs/exp3/time_0401_1157|50/checkpoint_model_000079/feedforward.bin"
-        parent_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp3/80"
+        ckp_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/outputs/cache/time_0401_2221|55/checkpoint_model_001119/feedforward.bin"
+        parent_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp3.6/1120"
         wan_t2v = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -341,8 +341,8 @@ def generate(args):
                         guide_scale=args.sample_guide_scale,
                         seed=args.base_seed,
                         offload_model=args.offload_model,
-                        predict_x0=True,
-                        save_mid_dir = f"/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp3/debug_80_x0/{args.prompt[:7]}_shift{args.sample_shift}_step{args.sample_steps}_"
+                        # predict_x0=True,
+                        # save_mid_dir = f"/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp3/debug_80_x0/{args.prompt[:7]}_shift{args.sample_shift}_step{args.sample_steps}_"
                         )
 
                     if rank == 0:

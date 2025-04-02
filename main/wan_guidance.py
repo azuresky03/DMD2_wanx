@@ -28,19 +28,6 @@ class WanGuidance(nn.Module):
         # self.real_unet = self.wan
         # self.fake_unet = self.wan
 
-        self.gan_alone = args.gan_alone 
-
-        # somehow FSDP requires at least one network with dense parameters (models from diffuser are lazy initialized so their parameters are empty in fsdp mode)
-        # self.dummy_network = DummyNetwork() 
-        # self.dummy_network.requires_grad_(False)
-
-        # we move real unet to half precision
-        # as we don't backpropagate through it
-        # if args.use_fp16:
-        #     self.wan = self.wan.to(torch.bfloat16)
-
-        if self.gan_alone:
-            del self.real_unet
 
         # self.scheduler = FlowMatchScheduler(shift=args.shift,sigma_min=0.0, extra_one_step=True)
         self.scheduler = FlowUniPCMultistepScheduler()
@@ -121,7 +108,7 @@ class WanGuidance(nn.Module):
                                             device=latents.device,
                                             dtype=torch.bfloat16)
             set_lora_state(self.wan, enabled=True)
-            _, _, _, _, fake_video = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor, timesteps, index)
+            _, _, _, _, fake_video = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor, timesteps, index)
 
             set_lora_state(self.wan, enabled=False)
             _, _, _, _, real_video = self.one_step(latents, encoder_hidden_states, guidance_tensor, timesteps, index)
@@ -172,7 +159,7 @@ class WanGuidance(nn.Module):
                                         device=latents.device,
                                         dtype=torch.bfloat16)
         set_lora_state(self.wan, enabled=True)
-        fake_dist_predict, fake_noise_pred, noisy_latents, noise, model_pred_x0 = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor,timesteps, index)
+        fake_dist_predict, fake_noise_pred, noisy_latents, noise, model_pred_x0 = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,timesteps, index)
 
         # epsilon prediction loss 
         loss_fake = torch.mean(
@@ -213,14 +200,12 @@ class WanGuidance(nn.Module):
         log_dict = {}
 
         # video.requires_grad_(True)
-        if not self.gan_alone:
-            dm_dict, dm_log_dict = self.compute_distribution_matching_loss(
-                video, encoder_hidden_states, uncond_embedding, guidance_tensor)
+        dm_dict, dm_log_dict = self.compute_distribution_matching_loss(
+            video, encoder_hidden_states, uncond_embedding, guidance_tensor)
 
-            loss_dict.update(dm_dict)
-            log_dict.update(dm_log_dict)
+        loss_dict.update(dm_dict)
+        log_dict.update(dm_log_dict)
 
-            # print(f"finished dm loss, {loss_dict}, {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024}GB")
 
         if self.cls_on_clean_image:
             clean_cls_loss_dict = self.compute_generator_clean_cls_loss(
@@ -255,7 +240,7 @@ class WanGuidance(nn.Module):
                                             device=video.device,
                                             dtype=torch.bfloat16)
             set_lora_state(self.wan, enabled=True)
-            rep = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=uncond_guidance_tensor,classify_mode=True)
+            rep = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,classify_mode=True)
 
             # logits = checkpoint(self.cls_pred_branch, rep, use_reentrant=False).squeeze(dim=1)
             logits = self.cls_pred_branch(rep).squeeze(dim=1)

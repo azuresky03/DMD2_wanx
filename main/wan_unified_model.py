@@ -11,6 +11,7 @@ from peft import LoraConfig
 from torch import nn
 import torch 
 from fastvideo.utils.communications import broadcast
+import torch.nn.functional as F
 
 from main.wan.modules.lora import  set_lora_state
 
@@ -54,20 +55,6 @@ class WanUniModel(nn.Module):
         self.network_context_manager = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if self.use_fp16 else NoOpContext()
 
         self.max_seq_len = args.max_seq_len
-
-    def build_condition_input(self, resolution, accelerator):
-        original_size = (resolution, resolution)
-        target_size = (resolution, resolution)
-        crop_top_left = (0, 0)
-
-        add_time_ids = list(original_size + crop_top_left + target_size)
-        add_time_ids = torch.tensor([add_time_ids], device=accelerator.device, dtype=torch.float32)
-        return add_time_ids
-
-    def decode_image(self, latents):
-        latents = 1 / self.vae.config.scaling_factor * latents
-        image = self.vae.decode(latents).sample.float()
-        return image 
 
     @torch.no_grad()
     def prepare_denoising_data(self, latents, noise):
@@ -148,6 +135,11 @@ class WanUniModel(nn.Module):
                     generator_data_dict=generator_data_dict
                 )
                 # self.guidance_model.requires_grad_(True)
+
+                if self.args.diffusion_loss:
+                    diffusion_loss = F.mse_loss(generated_noise.unsqueeze(0).float(), noise.float(),reduction="mean")
+                    # print(f"diffusion_loss: {diffusion_loss}")
+                    loss_dict["diffusion_loss"] = diffusion_loss
             else:
                 loss_dict = {}
                 log_dict = {} 
@@ -167,7 +159,8 @@ class WanUniModel(nn.Module):
         elif guidance_turn:
             assert guidance_data_dict is not None 
             set_lora_state(self.guidance_model,requires_grad=True)
-            self.guidance_model.cls_pred_branch.requires_grad_(True)
+            if self.args.cls_on_clean_image:
+                self.guidance_model.cls_pred_branch.requires_grad_(True)
             loss_dict, log_dict = self.guidance_model(
                 generator_turn=False,
                 guidance_turn=True,

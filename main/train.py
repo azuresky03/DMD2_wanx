@@ -141,8 +141,9 @@ class Trainer:
             main_print(f"load checkpoint from {args.ckpt_only_path}")
             dist.barrier()
         else:
-            for param in self.model.guidance_model.cls_pred_branch.parameters():
-                dist.broadcast(param.data, src=0)  # 从 rank 0 广播到其他进程
+            if args.cls_on_clean_image:
+                for param in self.model.guidance_model.cls_pred_branch.parameters():
+                    dist.broadcast(param.data, src=0)  # 从 rank 0 广播到其他进程
 
         dataset = LatentDataset(args.data_json_path)
         sampler = DistributedSampler(dataset, rank=rank, num_replicas=world_size, shuffle=False)
@@ -389,11 +390,13 @@ class Trainer:
         generator_loss = 0.0 
 
         if COMPUTE_GENERATOR_GRADIENT:
-            if not self.args.gan_alone:
-                generator_loss += generator_loss_dict["loss_dm"] * self.args.dm_loss_weight
+            generator_loss += generator_loss_dict["loss_dm"] * self.args.dm_loss_weight
 
             if self.cls_on_clean_image and self.gen_cls_loss:
                 generator_loss += generator_loss_dict["gen_cls_loss"] * self.gen_cls_loss_weight
+
+            if self.args.diffusion_loss:
+                generator_loss += generator_loss_dict["diffusion_loss"] * self.args.diffusion_loss_weight
 
             generator_loss.backward()
             if self.debug: main_print(f"backward generator_loss {torch.cuda.max_memory_reserved()/1024**3:.2f} GB")
@@ -442,7 +445,7 @@ class Trainer:
         if self.debug: main_print(f"log_dict: {log_dict.keys()} {log_dict['guidance_data_dict'].keys()}")
 
         loss_str = ""
-        for key in ["loss_fake_mean", "guidance_cls_loss", "loss_dm", "gen_cls_loss"]:
+        for key in ["loss_fake_mean", "guidance_cls_loss", "loss_dm", "gen_cls_loss","diffusion_loss"]:
             if key in loss_dict:
                 loss_dict[key] = gather_and_average_loss(loss_dict, key)
                 loss_str += f"{key}: {loss_dict[key].item():.4f} "
@@ -549,7 +552,6 @@ def parse_args():
     parser.add_argument("--revision", type=str)
 
     parser.add_argument("--real_image_path", type=str)
-    parser.add_argument("--gan_alone", action="store_true", help="only use the gan loss without dmd")
     parser.add_argument("--backward_simulation", action="store_true")
 
     parser.add_argument("--generator_lora", action="store_true")
@@ -572,6 +574,9 @@ def parse_args():
     parser.add_argument("--visual", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--gen_shift", type=float, default=3)
+    parser.add_argument("--diffusion_loss", action="store_true")
+    parser.add_argument("--diffusion_loss_weight", type=float, default=1)
+    parser.add_argument("--uncond_for_fake", action="store_true")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
