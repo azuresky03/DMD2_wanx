@@ -15,6 +15,12 @@ import torch.nn.functional as F
 
 from main.wan.modules.lora import  set_lora_state
 
+import os
+def main_print(content):
+    if int(os.environ["LOCAL_RANK"]) <= 0:
+        print(content)
+
+
 class WanUniModel(nn.Module):
     def __init__(self, args, device):
         super().__init__()
@@ -37,7 +43,7 @@ class WanUniModel(nn.Module):
         self.num_denoising_step = args.num_denoising_step 
         self.gen_scheduler = FlowUniPCMultistepScheduler()
         self.gen_scheduler.set_timesteps(self.num_denoising_step,device=device, shift=args.gen_shift)
-        self.denoising_step_list = self.gen_scheduler.timesteps
+        self.denoising_step_list = self.gen_scheduler.timesteps.to(device)
 
         if args.initialie_generator:
             self.feedforward_model = WanModel.from_pretrained(args.model_id)
@@ -63,8 +69,7 @@ class WanUniModel(nn.Module):
             0, self.num_denoising_step-1, (noise.shape[0],), device=noise.device, dtype=torch.long
         )
 
-        if self.args.sp_size > 1:
-            broadcast(indices)
+        torch.distributed.broadcast(indices, src=0)
 
         timesteps = self.denoising_step_list.to(noise.device)[indices]
         # print(f"timesteps: {timesteps} self.denoising_step_list: {self.denoising_step_list}")
@@ -116,6 +121,8 @@ class WanUniModel(nn.Module):
             self.gen_scheduler._step_index = int(indices.item())
             self.gen_scheduler.last_sample = None
             generated_video = self.gen_scheduler.step(sample=noisy_video, model_output=generated_noise, timestep=timesteps,return_dict=False)[1]
+            
+            input_noisy = noisy_video.detach()           
 
             # print(f"finished generation of fake video by generator, {torch.cuda.max_memory_reserved()/1024**3:.2f} GB")
 
@@ -137,9 +144,39 @@ class WanUniModel(nn.Module):
                 # self.guidance_model.requires_grad_(True)
 
                 if self.args.diffusion_loss:
-                    diffusion_loss = F.mse_loss(generated_noise.unsqueeze(0).float(), noise.float(),reduction="mean")
-                    # print(f"diffusion_loss: {diffusion_loss}")
+                    indice = int(indices.item())
+
+                    if indice < self.num_denoising_step-1:
+                        scheduler = FlowUniPCMultistepScheduler()
+                        scheduler.set_timesteps(self.num_denoising_step,device=self.device, shift=self.args.gen_shift)
+                        set_lora_state(self.guidance_model.wan,enabled=False)
+                        # main_print(f"indice: {indice}")
+                        with self.network_context_manager:
+                            for ind in range(indice,self.num_denoising_step):
+                                timesteps = self.denoising_step_list[torch.tensor([ind,],device=self.device,dtype=torch.long)]
+                                with torch.no_grad():
+                                    x = [input_noisy[i] for i in range(input_noisy.size(0))]
+                                    model_pred = self.guidance_model.wan(x,timesteps,None,self.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor)[0]
+                                    input_noisy = scheduler.step(sample=input_noisy, model_output=model_pred, timestep=timesteps,return_dict=False)[0]
+                        diffusion_loss = F.mse_loss(generated_video.float(), input_noisy.float(),reduction="mean") * (1 - 0.15*indice)
+                        log_dict["regression_video"] = input_noisy
+                    else:
+                        scheduler = FlowUniPCMultistepScheduler()
+                        scheduler.set_timesteps(self.num_denoising_step*2,device=self.device, shift=self.args.gen_shift)
+                        set_lora_state(self.guidance_model.wan,enabled=False)
+                        # main_print(f"indice: {indice}")
+                        with self.network_context_manager:
+                            for ind in range(indice*2,(self.num_denoising_step+1)*2):
+                                timesteps = self.denoising_step_list[torch.tensor([ind,],device=self.device,dtype=torch.long)]
+                                with torch.no_grad():
+                                    x = [input_noisy[i] for i in range(input_noisy.size(0))]
+                                    model_pred = self.guidance_model.wan(x,timesteps,None,self.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor)[0]
+                                    input_noisy = scheduler.step(sample=input_noisy, model_output=model_pred, timestep=timesteps,return_dict=False)[0]
+                        diffusion_loss = F.mse_loss(generated_video.float(), input_noisy.float(),reduction="mean") * (1 - 0.15*(indice-1))
+                        log_dict["regression_video"] = input_noisy
+                    # diffusion_loss = F.mse_loss(generated_noise.unsqueeze(0).float(), noise.float(),reduction="mean")
                     loss_dict["diffusion_loss"] = diffusion_loss
+                    torch.distributed.barrier()
             else:
                 loss_dict = {}
                 log_dict = {} 

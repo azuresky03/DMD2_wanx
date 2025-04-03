@@ -7,6 +7,7 @@ from main.utils import cycle
 from main.wan_unified_model import WanUniModel
 from main.wan.modules.lora import set_lora_state
 from fastvideo.dataset.latent_datasets import (LatentDataset, latent_collate_function)
+from fastvideo.utils.parallel_states import nccl_info
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 from accelerate.utils import set_seed
@@ -55,22 +56,16 @@ def gather_and_average_loss(loss_dict: dict, key: str) -> torch.Tensor:
     Returns:
         averaged_value (torch.Tensor): 所有设备上该 key 对应值的平均值
     """
-    # 获取当前设备的 value
     value = loss_dict[key]
     
-    # 确保所有设备上的 value 是张量
     if not isinstance(value, torch.Tensor):
         value = torch.tensor(value, device=torch.cuda.current_device())
+        print(f"key {key} is not tensor, convert to tensor {value}")
     
-    # 收集所有设备的值到列表
-    world_size = dist.get_world_size()
-    gathered_values = [torch.zeros_like(value) for _ in range(world_size)]
-    dist.all_gather(gathered_values, value)
+    dist.barrier()
+    dist.all_reduce(value, op=dist.ReduceOp.AVG)
     
-    # 拼接并计算平均
-    averaged_value = torch.mean(torch.stack(gathered_values))
-    
-    return averaged_value
+    return value
 
 class Trainer:
     def __init__(self, args):
@@ -447,6 +442,7 @@ class Trainer:
         loss_str = ""
         for key in ["loss_fake_mean", "guidance_cls_loss", "loss_dm", "gen_cls_loss","diffusion_loss"]:
             if key in loss_dict:
+                if self.debug: print(f"loss_dict {key}: {loss_dict[key]}")
                 loss_dict[key] = gather_and_average_loss(loss_dict, key)
                 loss_str += f"{key}: {loss_dict[key].item():.4f} "
         main_print(loss_str)
@@ -454,7 +450,7 @@ class Trainer:
         dist.barrier()
         torch.cuda.empty_cache()
 
-        if self.visual and self.rank == 0 and self.step % 10 == 0:
+        if (self.debug or (self.visual and self.step % 10 == 0)) and nccl_info.rank_within_group == 0:
             debug_save_dir = os.path.join(self.log_path, f"step_{self.step}")
             os.makedirs(debug_save_dir, exist_ok=True)
             log_dict["input"] = latents
@@ -463,7 +459,7 @@ class Trainer:
             for key in log_dict:
                 # if key not in [ 'faketrain_latents', 'faketrain_noisy_latents', 'faketrain_x0_pred']:
                 #     continue
-                if key in ["faketrain_latents","faketrain_x0_pred","real_video_for_cls","input","noisy_video","dmtrain_pred_real_video","dmtrain_pred_fake_video"]:
+                if key in ["regression_video","faketrain_latents","faketrain_x0_pred","real_video_for_cls","input","noisy_video","dmtrain_pred_real_video","dmtrain_pred_fake_video"]:
                     value = log_dict[key]
                     with torch.no_grad():
                         video = self.vae.decode([value.squeeze(0).float()])[0]

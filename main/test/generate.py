@@ -299,8 +299,8 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanT2V pipeline.")
-        ckp_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/outputs/cache/time_0401_2221|55/checkpoint_model_001119/feedforward.bin"
-        parent_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp3.6/1120"
+        ckp_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/outputs/exp4/time_0402_2325|29/checkpoint_model_000159/feedforward.bin"
+        parent_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp4/160"
         wan_t2v = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -320,8 +320,8 @@ def generate(args):
         with open(test_file, "r") as f:
             lines = f.readlines()
         for guidance in [5]:
-            for i in range(5):
-                for shift,step in [(3,5)]:
+            for i in range(10):
+                for shift,step in [(5,5),(2,5),(10,5)]:
                     if i not in [0,1,5,7,9,10,11]:
                         continue
                     line = lines[i]
