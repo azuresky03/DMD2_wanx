@@ -378,20 +378,26 @@ class Trainer:
             generator_turn=True,
             guidance_turn=False,
             guidance_cfg=guidance_cfg,
-            real_train_dict=real_train_dict
+            real_train_dict=real_train_dict,
+            step = self.step
         )
 
         # first update the generator if the current step is a multiple of dfake_gen_update_ratio
         generator_loss = 0.0 
 
         if COMPUTE_GENERATOR_GRADIENT:
-            generator_loss += generator_loss_dict["loss_dm"] * self.args.dm_loss_weight
+
+            if self.args.dmd_loss:
+                generator_loss_dict["loss_dm"] *= self.args.dm_loss_weight
+                generator_loss += generator_loss_dict["loss_dm"]
 
             if self.cls_on_clean_image and self.gen_cls_loss:
-                generator_loss += generator_loss_dict["gen_cls_loss"] * self.gen_cls_loss_weight
+                generator_loss_dict["gen_cls_loss"] *= self.gen_cls_loss_weight
+                generator_loss += generator_loss_dict["gen_cls_loss"]
 
             if self.args.diffusion_loss:
-                generator_loss += generator_loss_dict["diffusion_loss"] * self.args.diffusion_loss_weight
+                generator_loss_dict["diffusion_loss"] *= self.args.diffusion_loss_weight
+                generator_loss += generator_loss_dict["diffusion_loss"]
 
             generator_loss.backward()
             if self.debug: main_print(f"backward generator_loss {torch.cuda.max_memory_reserved()/1024**3:.2f} GB")
@@ -419,10 +425,11 @@ class Trainer:
 
         guidance_loss = 0 
 
-        guidance_loss += guidance_loss_dict["loss_fake_mean"]
+        guidance_loss += guidance_loss_dict["loss_fake_mean"] * 10
 
         if self.cls_on_clean_image:
-            guidance_loss += guidance_loss_dict["guidance_cls_loss"] * self.guidance_cls_loss_weight
+            guidance_loss_dict["guidance_cls_loss"] *= self.guidance_cls_loss_weight * 10
+            guidance_loss += guidance_loss_dict["guidance_cls_loss"]
 
         guidance_loss.backward()
         guidance_grad_norm = clip_grad_norm_(self.model.guidance_model.parameters(), self.max_grad_norm)
@@ -442,7 +449,7 @@ class Trainer:
         loss_str = ""
         for key in ["loss_fake_mean", "guidance_cls_loss", "loss_dm", "gen_cls_loss","diffusion_loss"]:
             if key in loss_dict:
-                if self.debug: print(f"loss_dict {key}: {loss_dict[key]}")
+                # if self.debug: print(f"loss_dict {key}: {loss_dict[key]}")
                 loss_dict[key] = gather_and_average_loss(loss_dict, key)
                 loss_str += f"{key}: {loss_dict[key].item():.4f} "
         main_print(loss_str)
@@ -450,7 +457,7 @@ class Trainer:
         dist.barrier()
         torch.cuda.empty_cache()
 
-        if (self.debug or (self.visual and self.step % 10 == 0)) and nccl_info.rank_within_group == 0:
+        if (self.debug or (self.visual and self.step % 30 == 0)) and nccl_info.rank_within_group == 0:
             debug_save_dir = os.path.join(self.log_path, f"step_{self.step}")
             os.makedirs(debug_save_dir, exist_ok=True)
             log_dict["input"] = latents
@@ -464,7 +471,7 @@ class Trainer:
                     with torch.no_grad():
                         video = self.vae.decode([value.squeeze(0).float()])[0]
                         cache_video(tensor=video[None],save_file=f"{debug_save_dir}/rank{dist.get_rank()}_{key}.mp4",fps=16,nrow=1,normalize=True,value_range=(-1, 1))
-            print(f"save video to {debug_save_dir}")
+            main_print(f"save video to {debug_save_dir}")
         dist.barrier()
                 
 
@@ -573,6 +580,8 @@ def parse_args():
     parser.add_argument("--diffusion_loss", action="store_true")
     parser.add_argument("--diffusion_loss_weight", type=float, default=1)
     parser.add_argument("--uncond_for_fake", action="store_true")
+    parser.add_argument("--dmd_loss", action="store_true")
+    parser.add_argument("--to_x0", action="store_true")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))

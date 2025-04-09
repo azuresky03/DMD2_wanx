@@ -82,7 +82,14 @@ class WanGuidance(nn.Module):
         self.scheduler.last_sample = None
         model_pred, model_pred_x0 = self.scheduler.step(sample=noisy_latents, model_output=pred_noise, timestep=timesteps,return_dict=False)
 
-        return model_pred, pred_noise, noisy_latents, noise, model_pred_x0
+
+        self.scheduler.model_outputs = [None] * self.scheduler.config.solver_order
+        self.scheduler.lower_order_nums = 0
+        self.scheduler._step_index = int(index.item())
+        self.scheduler.last_sample = None        
+        _, model_pred_x0_new = self.scheduler.step(sample=noisy_latents, model_output=noise, timestep=timesteps,return_dict=False)
+
+        return model_pred, pred_noise, noisy_latents, noise, model_pred_x0, model_pred_x0_new
 
     def compute_distribution_matching_loss(
         self, 
@@ -108,10 +115,10 @@ class WanGuidance(nn.Module):
                                             device=latents.device,
                                             dtype=torch.bfloat16)
             set_lora_state(self.wan, enabled=True)
-            _, _, _, _, fake_video = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor, timesteps, index)
+            _, _, _, _, fake_video, _ = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor, timesteps, index)
 
             set_lora_state(self.wan, enabled=False)
-            _, _, _, _, real_video = self.one_step(latents, encoder_hidden_states, guidance_tensor, timesteps, index)
+            _, _, _, _, real_video, _ = self.one_step(latents, encoder_hidden_states, guidance_tensor, timesteps, index)
 
             p_real = (latents - real_video)
             p_fake = (latents - fake_video)
@@ -159,11 +166,14 @@ class WanGuidance(nn.Module):
                                         device=latents.device,
                                         dtype=torch.bfloat16)
         set_lora_state(self.wan, enabled=True)
-        fake_dist_predict, fake_noise_pred, noisy_latents, noise, model_pred_x0 = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,timesteps, index)
+        fake_dist_predict, fake_noise_pred, noisy_latents, noise, model_pred_x0, model_pred_x0_new = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,timesteps, index)
 
         # epsilon prediction loss 
+        # loss_fake = torch.mean(
+        #     (fake_noise_pred.float() - noise.float())**2
+        # )
         loss_fake = torch.mean(
-            (fake_noise_pred.float() - noise.float())**2
+            (latents.float() - model_pred_x0.float())**2
         )
 
         loss_dict = {
@@ -173,7 +183,8 @@ class WanGuidance(nn.Module):
         fake_log_dict = {
             "faketrain_latents": latents.detach().float(),
             "faketrain_noisy_latents": noisy_latents.detach().float(),
-            "faketrain_x0_pred": model_pred_x0.detach().float()
+            "faketrain_x0_pred": model_pred_x0.detach().float(),
+            "model_pred_x0_new": model_pred_x0_new.detach().float(),
         }
         # if self.gradient_checkpointing:
         #     self.fake_unet.disable_gradient_checkpointing()
