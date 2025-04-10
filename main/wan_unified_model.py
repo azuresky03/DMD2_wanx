@@ -96,7 +96,9 @@ class WanUniModel(nn.Module):
         visual=False,
         guidance_data_dict=None,
         real_train_dict=None,
-        step = None   
+        step = None,
+        y=None,
+        clip_feature=None,
     ):
         assert (generator_turn and not guidance_turn) or (guidance_turn and not generator_turn) 
 
@@ -112,13 +114,13 @@ class WanUniModel(nn.Module):
             with self.network_context_manager:
                 if compute_generator_gradient:
                     self.feedforward_model.requires_grad_(True)
-                    generated_noise = self.feedforward_model(x,timesteps,None,self.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor)[0]
+                    generated_noise = self.feedforward_model(x,timesteps,None,self.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor,y=y,clip_fea=clip_feature)[0]
                 else:
                     # if self.gradient_checkpointing:
                     #     self.accelerator.unwrap_model(self.feedforward_model).disable_gradient_checkpointing()
                     self.feedforward_model.requires_grad_(False)
                     with torch.no_grad():
-                        generated_noise = self.feedforward_model(x,timesteps,None,self.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor)[0]
+                        generated_noise = self.feedforward_model(x,timesteps,None,self.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor,y=y,clip_fea=clip_feature)[0]
 
             self.gen_scheduler.lower_order_nums = 0
             self.gen_scheduler.model_outputs = [None] * self.gen_scheduler.config.solver_order
@@ -138,6 +140,8 @@ class WanUniModel(nn.Module):
                         "encoder_hidden_states": encoder_hidden_states,
                         "uncond_embedding": uncond_embedding,
                         "guidance_tensor": guidance_tensor,
+                        "y": y,
+                        "clip_feature": clip_feature,
                     } 
 
                     # avoid any side effects of gradient accumulation
@@ -167,7 +171,7 @@ class WanUniModel(nn.Module):
                             # main_print(f"timesteps {timesteps}")
                             with torch.no_grad():
                                 x = [input_noisy[i] for i in range(input_noisy.size(0))]
-                                model_pred = self.guidance_model.wan(x,timesteps,None,self.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor)[0]
+                                model_pred = self.guidance_model.wan(x,timesteps,None,self.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor,y=y,clip_fea=clip_feature)[0]
                                 input_noisy = scheduler.step(sample=input_noisy, model_output=model_pred, timestep=timesteps,return_dict=False)[1 if (not self.args.to_x0 and ind==(indice+mult-1)) else 0]
                     if self.args.to_x0:
                         scale = (sigmoid((1.1-(self.denoising_timestep - indice) / self.denoising_timestep) * ( (step/self.args.dfake_gen_update_ratio) if step else 1)) - 0.5) * 2
@@ -191,6 +195,8 @@ class WanUniModel(nn.Module):
                 "real_train_dict": real_train_dict,
                 "noisy_video":noisy_video.detach(),
                 "generated_noise":generated_noise.detach(),
+                "y": [yi.detach() for yi in y] if self.args.i2v else None,
+                "clip_feature": clip_feature.detach() if self.args.i2v else None, 
             }
 
             log_dict['denoising_timestep'] = timesteps

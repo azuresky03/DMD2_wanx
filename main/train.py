@@ -357,11 +357,19 @@ class Trainer:
         else:
             latents, encoder_hidden_states, latents_attention_mask, encoder_attention_mask, y, clip_feature = next(self.guidance_dataloader) 
         
+        if not self.args.i2v:
+            y = None
+            clip_feature = None
+        else:
+            y = [y[i].to(self.device) for i in range(y.shape[0])]
+
         if self.cls_on_clean_image:
             real_train_dict = dict()
             real_latents, real_encoder_hidden_states, real_latents_attention_mask, real_encoder_attention_mask, real_y, real_clip_feature = next(self.real_dataloader) 
             real_train_dict["latents"] = real_latents.to(self.device)
             real_train_dict["encoder_hidden_states"] = real_encoder_hidden_states.to(self.device)
+            real_train_dict["y"] = [real_y[i].to(self.device) for i in range(real_y.shape[0])] if self.args.i2v else None
+            real_train_dict["clip_feature"] = real_clip_feature.to(self.device) if self.args.i2v else None
         else:
             real_train_dict = None
 
@@ -379,7 +387,9 @@ class Trainer:
             guidance_turn=False,
             guidance_cfg=guidance_cfg,
             real_train_dict=real_train_dict,
-            step = self.step
+            step = self.step,
+            y = y,
+            clip_feature = clip_feature,
         )
 
         # first update the generator if the current step is a multiple of dfake_gen_update_ratio
@@ -420,7 +430,9 @@ class Trainer:
             compute_generator_gradient=COMPUTE_GENERATOR_GRADIENT,
             generator_turn=False,
             guidance_turn=True,
-            guidance_data_dict=generator_log_dict['guidance_data_dict']
+            guidance_data_dict=generator_log_dict['guidance_data_dict'],
+            y=y,
+            clip_feature=clip_feature,
         )
 
         guidance_loss = 0 
@@ -582,6 +594,7 @@ def parse_args():
     parser.add_argument("--uncond_for_fake", action="store_true")
     parser.add_argument("--dmd_loss", action="store_true")
     parser.add_argument("--to_x0", action="store_true")
+    parser.add_argument("--i2v", action="store_true")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))

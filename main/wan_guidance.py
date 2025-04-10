@@ -64,7 +64,7 @@ class WanGuidance(nn.Module):
 
         self.network_context_manager = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if self.use_fp16 else NoOpContext()
 
-    def one_step(self, latents, encoder_hidden_states, guidance_tensor, timesteps, index):
+    def one_step(self, latents, encoder_hidden_states, guidance_tensor, timesteps, index, y=None, clip_feature=None):
 
         noise = torch.randn_like(latents)
         if self.args.sp_size > 1:
@@ -74,7 +74,7 @@ class WanGuidance(nn.Module):
 
         x = [noisy_latents[i] for i in range(noisy_latents.size(0))]
         with self.network_context_manager:
-            pred_noise = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor)[0]
+            pred_noise = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor,y=y,clip_fea=clip_feature)[0]
 
         self.scheduler.model_outputs = [None] * self.scheduler.config.solver_order
         self.scheduler.lower_order_nums = 0
@@ -83,13 +83,13 @@ class WanGuidance(nn.Module):
         model_pred, model_pred_x0 = self.scheduler.step(sample=noisy_latents, model_output=pred_noise, timestep=timesteps,return_dict=False)
 
 
-        self.scheduler.model_outputs = [None] * self.scheduler.config.solver_order
-        self.scheduler.lower_order_nums = 0
-        self.scheduler._step_index = int(index.item())
-        self.scheduler.last_sample = None        
-        _, model_pred_x0_new = self.scheduler.step(sample=noisy_latents, model_output=noise, timestep=timesteps,return_dict=False)
+        # self.scheduler.model_outputs = [None] * self.scheduler.config.solver_order
+        # self.scheduler.lower_order_nums = 0
+        # self.scheduler._step_index = int(index.item())
+        # self.scheduler.last_sample = None        
+        # _, model_pred_x0_new = self.scheduler.step(sample=noisy_latents, model_output=noise, timestep=timesteps,return_dict=False)
 
-        return model_pred, pred_noise, noisy_latents, noise, model_pred_x0, model_pred_x0_new
+        return model_pred, pred_noise, noisy_latents, noise, model_pred_x0, None
 
     def compute_distribution_matching_loss(
         self, 
@@ -97,6 +97,8 @@ class WanGuidance(nn.Module):
         encoder_hidden_states,
         uncond_embedding,
         guidance_tensor,
+        y=None,
+        clip_feature=None
     ):
         original_latents = latents 
         with torch.no_grad():
@@ -115,10 +117,10 @@ class WanGuidance(nn.Module):
                                             device=latents.device,
                                             dtype=torch.bfloat16)
             set_lora_state(self.wan, enabled=True)
-            _, _, _, _, fake_video, _ = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor, timesteps, index)
+            _, _, _, _, fake_video, _ = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor, timesteps, index,y,clip_feature)
 
             set_lora_state(self.wan, enabled=False)
-            _, _, _, _, real_video, _ = self.one_step(latents, encoder_hidden_states, guidance_tensor, timesteps, index)
+            _, _, _, _, real_video, _ = self.one_step(latents, encoder_hidden_states, guidance_tensor, timesteps, index,y,clip_feature)
 
             p_real = (latents - real_video)
             p_fake = (latents - fake_video)
@@ -146,7 +148,9 @@ class WanGuidance(nn.Module):
         latents,
         encoder_hidden_states,
         uncond_embedding,
-        guidance_tensor
+        guidance_tensor,
+        y=None,
+        clip_feature=None
     ):
         # if self.gradient_checkpointing:
         #     self.fake_unet.enable_gradient_checkpointing()
@@ -166,7 +170,7 @@ class WanGuidance(nn.Module):
                                         device=latents.device,
                                         dtype=torch.bfloat16)
         set_lora_state(self.wan, enabled=True)
-        fake_dist_predict, fake_noise_pred, noisy_latents, noise, model_pred_x0, model_pred_x0_new = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,timesteps, index)
+        fake_dist_predict, fake_noise_pred, noisy_latents, noise, model_pred_x0, model_pred_x0_new = self.one_step(latents, encoder_hidden_states, uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,timesteps, index, y, clip_feature)
 
         # epsilon prediction loss 
         # loss_fake = torch.mean(
@@ -184,17 +188,17 @@ class WanGuidance(nn.Module):
             "faketrain_latents": latents.detach().float(),
             "faketrain_noisy_latents": noisy_latents.detach().float(),
             "faketrain_x0_pred": model_pred_x0.detach().float(),
-            "model_pred_x0_new": model_pred_x0_new.detach().float(),
+            "model_pred_x0_new": model_pred_x0_new.detach().float() if model_pred_x0_new is not None else None,
         }
         # if self.gradient_checkpointing:
         #     self.fake_unet.disable_gradient_checkpointing()
         return loss_dict, fake_log_dict
 
-    def compute_generator_clean_cls_loss(self, video, encoder_hidden_states, guidance_tensor):
+    def compute_generator_clean_cls_loss(self, video, encoder_hidden_states, guidance_tensor,y,clip_feature):
         loss_dict = {} 
 
         logits = self.compute_cls_logits(
-            video, encoder_hidden_states, guidance_tensor
+            video, encoder_hidden_states, guidance_tensor,y,clip_feature
         )
 
         loss_dict["gen_cls_loss"] = F.softplus(-logits).mean()
@@ -205,14 +209,16 @@ class WanGuidance(nn.Module):
         video,
         encoder_hidden_states,
         uncond_embedding,
-        guidance_tensor
+        guidance_tensor,
+        y=None,
+        clip_feature=None,
     ):
         loss_dict = {}
         log_dict = {}
 
         # video.requires_grad_(True)
         dm_dict, dm_log_dict = self.compute_distribution_matching_loss(
-            video, encoder_hidden_states, uncond_embedding, guidance_tensor)
+            video, encoder_hidden_states, uncond_embedding, guidance_tensor,y,clip_feature)
 
         loss_dict.update(dm_dict)
         log_dict.update(dm_log_dict)
@@ -220,15 +226,15 @@ class WanGuidance(nn.Module):
 
         if self.cls_on_clean_image:
             clean_cls_loss_dict = self.compute_generator_clean_cls_loss(
-                video, encoder_hidden_states, guidance_tensor
+                video, encoder_hidden_states, guidance_tensor,y,clip_feature
             )
             loss_dict.update(clean_cls_loss_dict)
 
-            # print(f"finished cls loss, {loss_dict}, {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024}GB")
+            if self.args.debug: print(f"finished cls loss, {loss_dict}, {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024}GB")
 
         return loss_dict, log_dict 
 
-    def compute_cls_logits(self, video, encoder_hidden_states, guidance_tensor):
+    def compute_cls_logits(self, video, encoder_hidden_states, guidance_tensor, y=None, clip_feature=None):
         with self.network_context_manager:
             if self.diffusion_gan:
                 index = torch.randint(
@@ -251,7 +257,7 @@ class WanGuidance(nn.Module):
                                             device=video.device,
                                             dtype=torch.bfloat16)
             set_lora_state(self.wan, enabled=True)
-            rep = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,classify_mode=True)
+            rep = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,classify_mode=True,y=y,clip_fea=clip_feature)
 
             # logits = checkpoint(self.cls_pred_branch, rep, use_reentrant=False).squeeze(dim=1)
             logits = self.cls_pred_branch(rep).squeeze(dim=1)
@@ -260,17 +266,17 @@ class WanGuidance(nn.Module):
 
     def compute_guidance_clean_cls_loss(
             self, real_image, fake_image, 
-            real_text_embedding, fake_text_embedding, guidance_tensor
+            real_text_embedding, fake_text_embedding, guidance_tensor, y=None, clip_feature=None, real_y=None, real_clip_feature=None
         ):
         pred_realism_on_real = self.compute_cls_logits(
             real_image.detach(), 
             encoder_hidden_states=real_text_embedding,
-            guidance_tensor=guidance_tensor
+            guidance_tensor=guidance_tensor, y=y, clip_feature=clip_feature
         )
         pred_realism_on_fake = self.compute_cls_logits(
             fake_image.detach(), 
             encoder_hidden_states=fake_text_embedding,
-            guidance_tensor=guidance_tensor
+            guidance_tensor=guidance_tensor, y=real_y, clip_feature=real_clip_feature
         )
 
         log_dict = {
@@ -291,10 +297,12 @@ class WanGuidance(nn.Module):
         encoder_hidden_states,
         uncond_embedding,
         guidance_tensor,
-        real_train_dict
+        real_train_dict,
+        y=None,
+        clip_feature=None,
     ):
         fake_dict, fake_log_dict = self.compute_loss_fake(
-            video, encoder_hidden_states, uncond_embedding, guidance_tensor)
+            video, encoder_hidden_states, uncond_embedding, guidance_tensor,y,clip_feature)
 
         loss_dict = fake_dict 
         log_dict = fake_log_dict
@@ -307,7 +315,11 @@ class WanGuidance(nn.Module):
                 fake_image=video,
                 real_text_embedding=real_train_dict['encoder_hidden_states'],
                 fake_text_embedding=encoder_hidden_states, 
-                guidance_tensor=guidance_tensor
+                guidance_tensor=guidance_tensor,
+                y = y,
+                clip_feature=clip_feature,
+                real_y=real_train_dict['y'],
+                real_clip_feature=real_train_dict['clip_feature'],
             )
             loss_dict.update(clean_cls_loss_dict)
             log_dict.update(clean_cls_log_dict)
@@ -327,7 +339,9 @@ class WanGuidance(nn.Module):
                 video=generator_data_dict["video"],
                 encoder_hidden_states=generator_data_dict["encoder_hidden_states"],
                 uncond_embedding=generator_data_dict["uncond_embedding"],
-                guidance_tensor=generator_data_dict["guidance_tensor"]
+                guidance_tensor=generator_data_dict["guidance_tensor"],
+                y=generator_data_dict["y"],
+                clip_feature=generator_data_dict["clip_feature"],
             )   
         elif guidance_turn:
             loss_dict, log_dict = self.guidance_forward(
@@ -336,6 +350,8 @@ class WanGuidance(nn.Module):
                 uncond_embedding=guidance_data_dict["uncond_embedding"],
                 guidance_tensor=guidance_data_dict["guidance_tensor"],
                 real_train_dict=guidance_data_dict["real_train_dict"],
+                y=guidance_data_dict["y"],
+                clip_feature=guidance_data_dict["clip_feature"],
             ) 
         else:
             raise NotImplementedError
