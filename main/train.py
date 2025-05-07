@@ -198,6 +198,7 @@ class Trainer:
 
         self.model.feedforward_model = FSDP(
         self.model.feedforward_model,
+        use_orig_params=args.generator_lora,
         **feedforward_model_fsdp_kwargs,
         )
 

@@ -13,7 +13,7 @@ import torch
 from fastvideo.utils.communications import broadcast
 import torch.nn.functional as F
 
-from main.wan.modules.lora import  set_lora_state
+from main.wan.modules.lora import  set_lora_state, apply_lora_to_wanx
 
 import os
 def main_print(content):
@@ -52,7 +52,9 @@ class WanUniModel(nn.Module):
             self.feedforward_model = WanModel.from_pretrained(args.model_id)
 
             if args.generator_lora:
-                raise NotImplementedError()
+                self.feedforward_model.requires_grad_(False)
+                apply_lora_to_wanx(self.feedforward_model,args.lora_rank, args.lora_scale)
+                set_lora_state(self.feedforward_model, enabled=True)
             else:
                 self.feedforward_model.requires_grad_(True)
 
@@ -68,9 +70,12 @@ class WanUniModel(nn.Module):
     @torch.no_grad()
     def prepare_denoising_data(self, latents, noise):
 
-        indices = torch.randint(
-            0, self.num_denoising_step-1, (noise.shape[0],), device=noise.device, dtype=torch.long
-        )
+        if self.num_denoising_step==1:
+            indices = torch.tensor([0], device=noise.device, dtype=torch.long)
+        else:
+            indices = torch.randint(
+                0, self.num_denoising_step-1, (noise.shape[0],), device=noise.device, dtype=torch.long
+            )
 
         torch.distributed.broadcast(indices, src=0)
 
@@ -113,7 +118,10 @@ class WanUniModel(nn.Module):
             x = [noisy_video[i] for i in range(noisy_video.size(0))]
             with self.network_context_manager:
                 if compute_generator_gradient:
-                    self.feedforward_model.requires_grad_(True)
+                    if self.args.generator_lora:
+                        set_lora_state(self.feedforward_model,requires_grad=True)
+                    else:
+                        self.feedforward_model.requires_grad_(True)
                     generated_noise = self.feedforward_model(x,timesteps,None,self.max_seq_len,batch_context=encoder_hidden_states,guidance=guidance_tensor,y=y,clip_fea=clip_feature)[0]
                 else:
                     # if self.gradient_checkpointing:

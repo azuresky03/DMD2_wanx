@@ -216,6 +216,7 @@ class WanSelfAttention(nn.Module):
             k = rope_apply(k, grid_sizes, freqs)
 
         if get_sequence_parallel_state():
+            # print("rank {}: q shape {}, k shape {}, v shape {}".format(rank, q.shape, k.shape, v.shape))
             q = all_to_all_4D(q, scatter_dim=2, gather_dim=1)
             k = all_to_all_4D(k, scatter_dim=2, gather_dim=1)
             v = all_to_all_4D(v, scatter_dim=2, gather_dim=1)
@@ -760,3 +761,26 @@ class WanModelCFG(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+
+if __name__ == '__main__':
+    import os 
+    from safetensors.torch import save_file
+    import json
+
+    model = WanModelCFG.from_pretrained("/cv/wangxuekuan/release_model/wanx/distill_cfg_t2v/exp10_distill_cfg/checkpoint-500")
+    ckp_dir = "/cv/zhangpengpeng/cv/video_generation/DMD2_wanx/outputs/cache/time_0409_1448|26/checkpoint_model_000499/feedforward.bin"
+    model.load_state_dict(torch.load(ckp_dir,weights_only=True))
+
+    save_dir = ckp_dir.replace(".bin", "")
+    os.makedirs(save_dir, exist_ok=True)
+    # save using safetensors
+    weight_path = os.path.join(save_dir, "diffusion_pytorch_model.safetensors")
+    save_file(model.state_dict(), weight_path)
+    config_dict = dict(model.config)
+    if "dtype" in config_dict:
+        del config_dict["dtype"]  # TODO
+    config_path = os.path.join(save_dir, "config.json")
+    # save dict as json
+    with open(config_path, "w") as f:
+        json.dump(config_dict, f, indent=4)

@@ -36,5 +36,6 @@ torchrun --nnodes 1 --nproc_per_node 8 --master-port 29516\
     --gen_cls_loss \
     --gen_cls_loss_weight 0.1 \
     --guidance_cls_loss_weight 0.003 \
+    # --generator_lora \
     # --ckpt_only_path "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/outputs/exp1.5/time_0327_1702|49_seed42/checkpoint_model_000049" \
     # --model_id /vepfs-zulution/zhangpengpeng/cv/video_generation/Wan2.1/data/outputs/exp15_distill_cfg_sequence_parallel/checkpoint-200 \

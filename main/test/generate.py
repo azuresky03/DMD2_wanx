@@ -299,8 +299,10 @@ def generate(args):
             logging.info(f"Extended prompt: {args.prompt}")
 
         logging.info("Creating WanT2V pipeline.")
-        ckp_dir = "/cv/zhangpengpeng/cv/video_generation/DMD2_wanx/outputs/cache/time_0409_1448|26/checkpoint_model_000999/feedforward.bin"
-        parent_dir = "/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp6.5/1000"
+        # args.size, size_name = "832*480", "480p"
+        args.size, size_name = "1280*720", "720p"
+        ckp_dir = "/cv/zhangpengpeng/cv/video_generation/DMD2_wanx/outputs/cache/time_0424_2046|41/checkpoint_model_000499/feedforward.bin"
+        parent_dir = f"/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp10/500_{size_name}"
         wan_t2v = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -319,9 +321,9 @@ def generate(args):
         test_file = "/vepfs-zulution/zhangpengpeng/cv/video_generation/HunyuanVideo/test_prompts.txt"
         with open(test_file, "r") as f:
             lines = f.readlines()
-        for guidance in [8]:
-            for i in range(10):
-                for shift,step in [(10,5),(7,5)]:
+        for guidance in [5,8]:
+            for i in range(20):
+                for shift,step in [(10,1)]:
                     # if i not in [0,1,5,7,9,10,11]:
                     #     continue
                     line = lines[i]
@@ -383,34 +385,10 @@ def generate(args):
         logging.info(f"Input prompt: {args.prompt}")
         logging.info(f"Input image: {args.image}")
 
-        # img = Image.open(args.image).convert("RGB")
-        # if args.use_prompt_extend:
-        #     logging.info("Extending prompt ...")
-        #     if rank == 0:
-        #         prompt_output = prompt_expander(
-        #             args.prompt,
-        #             tar_lang=args.prompt_extend_target_lang,
-        #             image=img,
-        #             seed=args.base_seed)
-        #         if prompt_output.status == False:
-        #             logging.info(
-        #                 f"Extending prompt failed: {prompt_output.message}")
-        #             logging.info("Falling back to original prompt.")
-        #             input_prompt = args.prompt
-        #         else:
-        #             input_prompt = prompt_output.prompt
-        #         input_prompt = [input_prompt]
-        #     else:
-        #         input_prompt = [None]
-        #     if dist.is_initialized():
-        #         dist.broadcast_object_list(input_prompt, src=0)
-        #     args.prompt = input_prompt[0]
-        #     logging.info(f"Extended prompt: {args.prompt}")
-
         # args.size, size_name = "480*832", "480p"
         args.size, size_name = "1280*720", "720p"
-        parent_dir = f"/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/outputs/exp7/400_{size_name}"
-        ckp_dir = "/cv/zhangpengpeng/cv/video_generation/DMD2_wanx/outputs/cache/time_0409_2111|29/checkpoint_model_000399/feedforward.bin"
+        parent_dir = f"/vepfs-zulution/zhangpengpeng/cv/video_generation/DMD2/exp_results/exp9/1900_{size_name}"
+        ckp_dir = "/cv/zhangpengpeng/cv/video_generation/DMD2_wanx/outputs/cache/time_0415_1727|26/checkpoint_model_001899/feedforward.bin"
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
             config=cfg,
@@ -435,7 +413,7 @@ def generate(args):
             img = Image.open(prompts_dir+image_dir).convert("RGB")
             args.prompt = prompt
             for guidance in [8]:
-                for shift in [5]:
+                for shift in [10,15]:
                     args.sample_shift = shift
                     args.sample_guide_scale = guidance
                     video = wan_i2v.generate(

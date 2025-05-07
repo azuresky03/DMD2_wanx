@@ -13,6 +13,10 @@ from fastvideo.utils.communications import broadcast
 from torch.utils.checkpoint import checkpoint
 
 from time import sleep
+import os
+def main_print(content):
+    if int(os.environ["LOCAL_RANK"]) <= 0:
+        print(content)
 
 class WanGuidance(nn.Module):
     def __init__(self, args, device):
@@ -230,11 +234,20 @@ class WanGuidance(nn.Module):
             )
             loss_dict.update(clean_cls_loss_dict)
 
-            if self.args.debug: print(f"finished cls loss, {loss_dict}, {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024}GB")
+            if self.args.debug: main_print(f"finished cls loss, {loss_dict}, {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024}GB")
 
         return loss_dict, log_dict 
 
     def compute_cls_logits(self, video, encoder_hidden_states, guidance_tensor, y=None, clip_feature=None):
+        # cut = y is not None
+        # if cut:
+        #     cut_len = video.shape[2] // 3
+        #     video = video[:, :, :cut_len, :, :]
+        #     y = [y[i][:, :cut_len,:,:] for i in range(len(y))]
+        #     seq_len = self.args.max_seq_len//3
+        # else:
+        #     seq_len = self.args.max_seq_len
+        seq_len = self.args.max_seq_len
         with self.network_context_manager:
             if self.diffusion_gan:
                 index = torch.randint(
@@ -257,7 +270,7 @@ class WanGuidance(nn.Module):
                                             device=video.device,
                                             dtype=torch.bfloat16)
             set_lora_state(self.wan, enabled=True)
-            rep = self.wan(x,timesteps,None,self.args.max_seq_len,batch_context=encoder_hidden_states,guidance=uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,classify_mode=True,y=y,clip_fea=clip_feature)
+            rep = self.wan(x,timesteps,None,seq_len,batch_context=encoder_hidden_states,guidance=uncond_guidance_tensor if self.args.uncond_for_fake else guidance_tensor,classify_mode=True,y=y,clip_fea=clip_feature)
 
             # logits = checkpoint(self.cls_pred_branch, rep, use_reentrant=False).squeeze(dim=1)
             logits = self.cls_pred_branch(rep).squeeze(dim=1)
@@ -271,12 +284,12 @@ class WanGuidance(nn.Module):
         pred_realism_on_real = self.compute_cls_logits(
             real_image.detach(), 
             encoder_hidden_states=real_text_embedding,
-            guidance_tensor=guidance_tensor, y=y, clip_feature=clip_feature
+            guidance_tensor=guidance_tensor, y=real_y, clip_feature=real_clip_feature
         )
         pred_realism_on_fake = self.compute_cls_logits(
             fake_image.detach(), 
             encoder_hidden_states=fake_text_embedding,
-            guidance_tensor=guidance_tensor, y=real_y, clip_feature=real_clip_feature
+            guidance_tensor=guidance_tensor, y=y, clip_feature=clip_feature
         )
 
         log_dict = {
