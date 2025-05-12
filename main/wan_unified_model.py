@@ -4,7 +4,6 @@ from diffusers import UNet2DConditionModel, AutoencoderKL, AutoencoderTiny
 from main.wan.modules.model_cfg import WanModelCFG as WanModel
 from main.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from main.utils import get_x0_from_noise, NoOpContext
-from main.sdxl.sdxl_text_encoder import SDXLTextEncoder
 from main.wan_guidance import WanGuidance
 from transformers import CLIPTextModel
 from peft import LoraConfig
